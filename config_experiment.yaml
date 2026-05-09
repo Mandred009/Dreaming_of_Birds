@@ -1,0 +1,92 @@
+experiment:
+  name: "exp_4_may08_rgb_all"
+  seed: 42
+  notes: "SDXL 1.5 oriented experiment config; pixel-space BEV generation baseline with ViT-token fusion."
+  run_group: "local"
+  tags: ["sdxl15", "bev", "pixel", "vit", "multiview"]
+
+logging:
+  tensorboard:
+    enabled: true
+    log_dir: "./runs/tensorboard"
+  log_every_steps: 50
+  save_every_steps: 5000
+  validate_every_steps: 500
+  # Full DDPM denoise from Gaussian latents for viz/recon_collage (training scheduler subset).
+  collage_inference_steps: 500
+
+data:
+  bev_root: "./bev_outputs"
+  occ3d_base_dir: "/home/vbontal1/Downloads/Occupancy3D"
+  annotations_json: null
+  resolution: 256  
+  num_workers: 0  # Set to 0 to avoid deadlock
+  shuffle: true
+  drop_last: true
+
+model:
+  type: "sd15_multicontrolnet"
+  output_space: "pixel"   # pixel output via VAE decode
+
+  sd15:
+    pretrained: "runwayml/stable-diffusion-v1-5"
+    prompt: "a high quality image of a road scene as seen from a bird's eye view"
+    local_files_only: false
+
+  controlnet:
+    train: true
+    # Multiple ControlNets; each entry becomes its own ControlNet module.
+    # Options for source:
+    # - rgb_front | depth_front | seg_front
+    # - rgb_all   | depth_all   | seg_all     (uses all 6 camera views)
+    sources: ["rgb_all"]
+    scales: [1.0]
+    # View-index conditioning for multi-view control images (rgb_all/depth_all/seg_all).
+    # Indices must align with the dataloader's camera order in `data_loader.CAMERAS`.
+    num_views: 6
+    use_view_embed: true
+    # View conditioning type: learned | sinusoidal | none
+    view_encoding: "sinusoidal"
+    # When using *_all (B,V,3,H,W), fuse per-view ControlNet residuals with learned softmax weights
+    # (same ControlNet for all V views; weights are normalized so they sum to 1 across views).
+    learned_view_fusion: true
+    # Multi-head attention across views on ControlNet residuals (before weighted fusion).
+    use_view_cross_attn: false
+    view_attn_d_model: 256
+    view_attn_nhead: 8
+    view_attn_dropout: 0.0
+    # If true, freeze SD UNet and train only ControlNet (recommended baseline).
+    freeze_unet: true
+
+  # Baseline-only blocks are unused for sd15_multicontrolnet:
+  # fusion/branches/generator
+
+train:
+  device: "cuda"
+  precision: "bf16"       # bf16 | fp32
+  batch_size: 4  # Keep at minimum
+  grad_accumulation: 4
+  max_steps: 25000
+  grad_clip: 1.0
+
+optim:
+  optimizer: "adamw"
+  lr: 1.0e-5
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-2
+  warmup_steps: 200
+  scheduler: "cosine"     # cosine | constant
+
+loss:
+  # Diffusion noise-pred loss
+  noise_pred_weight: 1.0
+  # Min-SNR weighting for eps MSE (0 disables). Typical values: 5.0, 10.0.
+  snr_gamma: 5.0
+  # Optional pixel-space SSIM on predicted x0 (adds a BEV perceptual-ish constraint).
+  # Note: increases compute (VAE decode each train step).
+  x0_ssim_weight: 0.001
+  x0_ssim_window: 11
+  # Optional dense L1 on predicted x0 BEV vs GT at every pixel and channel.
+  x0_l1_weight: 0.001
+

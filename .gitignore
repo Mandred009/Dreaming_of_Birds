@@ -1,4 +1,6 @@
 Depth-Anything-3
 checkpoints
-bev_output
-
+bev_outputs
+.vscode
+runs
+__pycache__
