@@ -1,5 +1,5 @@
 experiment:
-  name: "exp_4_may08_rgb_all"
+  name: "exp_6_may09_depth_seg"
   seed: 42
   notes: "SDXL 1.5 oriented experiment config; pixel-space BEV generation baseline with ViT-token fusion."
   run_group: "local"
@@ -14,6 +14,9 @@ logging:
   validate_every_steps: 500
   # Full DDPM denoise from Gaussian latents for viz/recon_collage (training scheduler subset).
   collage_inference_steps: 500
+  # Validation collage: classifier-free guidance (matches CFG dropout training).
+  use_cfg_validation: true
+  cfg_guidance_scale: 7.5
 
 data:
   bev_root: "./bev_outputs"
@@ -32,6 +35,12 @@ model:
     pretrained: "runwayml/stable-diffusion-v1-5"
     prompt: "a high quality image of a road scene as seen from a bird's eye view"
     local_files_only: false
+    # Optional: fine-tune the SD VAE to better encode/decode BEV-style maps.
+    # This can help sharpness/alignment but may destabilize if LR is too high.
+    train_vae: false
+    vae_lr_mult: 0.1
+    # Must stay 0 if decoder gets no gradients (no x0 pixel losses): else AdamW WD collapses decode to grey.
+    vae_weight_decay: 0.0
 
   controlnet:
     train: true
@@ -39,8 +48,8 @@ model:
     # Options for source:
     # - rgb_front | depth_front | seg_front
     # - rgb_all   | depth_all   | seg_all     (uses all 6 camera views)
-    sources: ["rgb_all"]
-    scales: [1.0]
+    sources: ["depth_all", "seg_all"]
+    scales: [1.0, 1.0]
     # View-index conditioning for multi-view control images (rgb_all/depth_all/seg_all).
     # Indices must align with the dataloader's camera order in `data_loader.CAMERAS`.
     num_views: 6
@@ -49,14 +58,17 @@ model:
     view_encoding: "sinusoidal"
     # When using *_all (B,V,3,H,W), fuse per-view ControlNet residuals with learned softmax weights
     # (same ControlNet for all V views; weights are normalized so they sum to 1 across views).
-    learned_view_fusion: true
+    learned_view_fusion: false
     # Multi-head attention across views on ControlNet residuals (before weighted fusion).
-    use_view_cross_attn: false
-    view_attn_d_model: 256
+    use_view_cross_attn: true
+    view_attn_d_model: 512
     view_attn_nhead: 8
     view_attn_dropout: 0.0
     # If true, freeze SD UNet and train only ControlNet (recommended baseline).
     freeze_unet: true
+    # CFG-style training (empty prompt / zero control); ~10–15% each is typical.
+    cfg_dropout_prompt_p: 0.125
+    cfg_dropout_control_p: 0.125
 
   # Baseline-only blocks are unused for sd15_multicontrolnet:
   # fusion/branches/generator
@@ -64,14 +76,14 @@ model:
 train:
   device: "cuda"
   precision: "bf16"       # bf16 | fp32
-  batch_size: 4  # Keep at minimum
+  batch_size: 2  # Keep at minimum
   grad_accumulation: 4
   max_steps: 25000
   grad_clip: 1.0
 
 optim:
   optimizer: "adamw"
-  lr: 1.0e-5
+  lr: 3.0e-5
   betas: [0.9, 0.999]
   eps: 1.0e-8
   weight_decay: 1.0e-2
@@ -85,8 +97,13 @@ loss:
   snr_gamma: 5.0
   # Optional pixel-space SSIM on predicted x0 (adds a BEV perceptual-ish constraint).
   # Note: increases compute (VAE decode each train step).
-  x0_ssim_weight: 0.001
+  x0_ssim_weight: 0
   x0_ssim_window: 11
   # Optional dense L1 on predicted x0 BEV vs GT at every pixel and channel.
-  x0_l1_weight: 0.001
+  x0_l1_weight: 0
+  # VAE round-trip when model.sd15.train_vae is true: decode(encode(bev)) vs bev in [-1,1].
+  vae_recon_weight: 0.1
+  vae_recon_type: l1
+  # KL on latent vs prior; keep small (e.g. 1e-6) or 0.
+  vae_kl_weight: 1.0e-6
 

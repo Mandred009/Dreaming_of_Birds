@@ -110,6 +110,7 @@ class SD15MultiControlNetBEV(nn.Module):
         prompt: str = "a high quality image of a road scene as seen from a bird's eye view",
         local_files_only: bool = False,
         freeze_unet: bool = True,
+        train_vae: bool = False,
         num_views: int = 6,
         use_view_embed: bool = True,
         view_encoding: str = "learned",  # learned | sinusoidal | none
@@ -118,12 +119,18 @@ class SD15MultiControlNetBEV(nn.Module):
         view_attn_d_model: int = 256,
         view_attn_nhead: int = 8,
         view_attn_dropout: float = 0.0,
+        # CFG-style training: randomly drop text / control so inference can use classifier-free guidance.
+        cfg_dropout_prompt_p: float = 0.125,
+        cfg_dropout_control_p: float = 0.125,
     ) -> None:
         super().__init__()
         self.pretrained = pretrained
         self.prompt = prompt
         self.local_files_only = local_files_only
         self.freeze_unet = freeze_unet
+        self.train_vae = bool(train_vae)
+        self.cfg_dropout_prompt_p = float(cfg_dropout_prompt_p)
+        self.cfg_dropout_control_p = float(cfg_dropout_control_p)
         self.num_views = int(num_views)
         self.learned_view_fusion = bool(learned_view_fusion)
         self.use_view_cross_attn = bool(use_view_cross_attn)
@@ -255,13 +262,16 @@ class SD15MultiControlNetBEV(nn.Module):
         print(f" ✓", flush=True)
 
         print(f"[MODEL] Freezing pretrained models...", flush=True)
-        self.vae.requires_grad_(False)
+        self.vae.requires_grad_(self.train_vae)
         self.text_encoder.requires_grad_(False)
         # ControlNet-only training: always freeze UNet (and VAE/text encoders above).
         self.unet.requires_grad_(False)
         for cn in self.controlnets:
             cn.requires_grad_(True)
-        print(f"[MODEL]   ✓ All parameters frozen except ControlNets", flush=True)
+        if self.train_vae:
+            print(f"[MODEL]   ✓ Frozen: UNet + text encoder; trainable: ControlNet + VAE", flush=True)
+        else:
+            print(f"[MODEL]   ✓ Frozen: UNet + VAE + text encoder; trainable: ControlNet", flush=True)
 
         # Memory savers
         print(f"[MODEL] Enabling memory optimizations...", flush=True)
@@ -295,10 +305,22 @@ class SD15MultiControlNetBEV(nn.Module):
         print(f"[MODEL] Model initialization complete!", flush=True)
 
         self.register_buffer("_prompt_embeds", torch.empty(0), persistent=False)
+        self.register_buffer("_prompt_embeds_empty", torch.empty(0), persistent=False)
+
     @torch.no_grad()
     def _encode_prompt(self, device: torch.device) -> None:
         self._prompt_embeds = _encode_prompt_sd15(
             prompt=self.prompt,
+            tokenizer=self.tokenizer,
+            text_encoder=self.text_encoder,
+            device=device,
+        )
+
+    @torch.no_grad()
+    def _encode_empty_prompt(self, device: torch.device) -> None:
+        """Unconditional text embedding for CFG-style dropout (empty prompt)."""
+        self._prompt_embeds_empty = _encode_prompt_sd15(
+            prompt="",
             tokenizer=self.tokenizer,
             text_encoder=self.text_encoder,
             device=device,
@@ -313,6 +335,10 @@ class SD15MultiControlNetBEV(nn.Module):
             print(f"[MODEL] Encoding prompt...", flush=True)
             self._encode_prompt(device)
             print(f"[MODEL] ✓ Prompt encoding complete", flush=True)
+        if self._prompt_embeds_empty.numel() == 0:
+            print(f"[MODEL] Encoding empty prompt (CFG dropout)...", flush=True)
+            self._encode_empty_prompt(device)
+            print(f"[MODEL] ✓ Empty prompt encoding complete", flush=True)
 
     def forward(
         self,
@@ -365,10 +391,14 @@ class SD15MultiControlNetBEV(nn.Module):
         control_images: Tuple[torch.Tensor, ...],
         control_scales: Optional[Tuple[float, ...]] = None,
         view_ids: Optional[torch.Tensor] = None,
+        force_empty_prompt: bool = False,
+        force_zero_control: bool = False,
     ) -> torch.Tensor:
         """
         Predict epsilon for a provided (noisy_latents, timesteps) pair.
-        This is useful for inference-only validation reconstructions.
+
+        For classifier-free guidance at inference, call twice with
+        (force_empty_prompt=False, force_zero_control=False) vs (True, True), then combine.
         """
         device = noisy_latents.device
         b = noisy_latents.shape[0]
@@ -381,7 +411,24 @@ class SD15MultiControlNetBEV(nn.Module):
         if len(control_scales) != len(control_images):
             raise ValueError("control_scales length must match control_images length")
 
-        prompt_embeds = self._prompt_embeds.expand(b, -1, -1)
+        prompt_embeds = self._prompt_embeds.expand(b, -1, -1).clone()
+        drop_ctrl = None
+        if force_empty_prompt:
+            prompt_embeds = self._prompt_embeds_empty.expand(b, -1, -1).to(dtype=prompt_embeds.dtype)
+        elif self.training:
+            pp = self.cfg_dropout_prompt_p
+            if pp > 0:
+                drop_p = torch.rand(b, device=device) < pp
+                pe_empty = self._prompt_embeds_empty.expand(b, -1, -1).to(dtype=prompt_embeds.dtype)
+                prompt_embeds = torch.where(drop_p[:, None, None], pe_empty, prompt_embeds)
+
+        if force_zero_control:
+            drop_ctrl = torch.ones(b, device=device, dtype=torch.bool)
+        elif self.training:
+            pc = self.cfg_dropout_control_p
+            if pc > 0:
+                drop_ctrl = torch.rand(b, device=device) < pc
+
         # Sum residuals across controlnets (and across views inside each control image)
         down_sum = None
         mid_sum = None
@@ -389,6 +436,8 @@ class SD15MultiControlNetBEV(nn.Module):
             # img can be (B,3,H,W) or (B,V,3,H,W)
             if img.ndim == 4:
                 ctrl = img * 2.0 - 1.0
+                if drop_ctrl is not None:
+                    ctrl = ctrl * (~drop_ctrl).float().view(b, 1, 1, 1)
                 cn_out = cn(
                     noisy_latents,
                     timesteps,
@@ -403,7 +452,10 @@ class SD15MultiControlNetBEV(nn.Module):
                 b0, v0, c0, h0, w0 = img.shape
                 if b0 != b:
                     raise ValueError("control image batch mismatch")
-                ctrl = (img * 2.0 - 1.0).reshape(b0 * v0, c0, h0, w0)
+                ctrl = (img * 2.0 - 1.0)
+                if drop_ctrl is not None:
+                    ctrl = ctrl * (~drop_ctrl).float().view(b0, 1, 1, 1, 1)
+                ctrl = ctrl.reshape(b0 * v0, c0, h0, w0)
 
                 lat_rep = noisy_latents.repeat_interleave(v0, dim=0)
                 ts_rep = timesteps.repeat_interleave(v0, dim=0)
@@ -443,6 +495,10 @@ class SD15MultiControlNetBEV(nn.Module):
                     else:
                         raise RuntimeError(f"Unexpected view_encoding={self.view_encoding}")
 
+                    if drop_ctrl is not None:
+                        # Drop view embedding when control is dropped; keep text tokens intact.
+                        keep_v = (~drop_ctrl).repeat_interleave(v0).float().unsqueeze(-1)
+                        ve = ve * keep_v
                     pe_rep = pe_rep + ve.unsqueeze(1)  # add per-view conditioning to all tokens
                 cn_out = cn(
                     lat_rep,

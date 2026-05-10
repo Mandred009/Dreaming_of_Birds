@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -53,6 +54,10 @@ class LossConfig:
     x0_ssim_window: int = 11
     # Dense L1 on predicted x0 BEV: every (H,W) position and channel vs GT (same grid).
     x0_l1_weight: float = 0.0
+    # VAE autoencoding: decode(encode(bev)) vs bev in [-1,1]. Use when finetuning VAE.
+    vae_recon_weight: float = 0.0
+    vae_recon_type: str = "l1"  # l1 | l2
+    vae_kl_weight: float = 0.0
 
 
 class Losses:
@@ -129,3 +134,38 @@ class Losses:
         l1 = F.l1_loss(pred_bev, target_bev)
         loss = l1 * float(self.cfg.x0_l1_weight)
         return loss, {"loss/x0_l1": float(loss.detach().cpu())}
+
+    def vae_recon_and_kl(self, vae: nn.Module, bev_in: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Standard VAE-style reconstruction in SD latent space (no scaling_factor in decode path).
+        bev_in: (B,3,H,W) in [-1,1], same as diffusers encode input.
+        """
+        w = float(self.cfg.vae_recon_weight)
+        kw = float(self.cfg.vae_kl_weight)
+        if w == 0 and kw == 0:
+            z = bev_in.new_tensor(0.0)
+            return z, {"loss/vae_recon": 0.0, "loss/vae_kl": 0.0}
+
+        post = vae.encode(bev_in).latent_dist
+        total = bev_in.new_tensor(0.0)
+        logs: Dict[str, float] = {"loss/vae_recon": 0.0, "loss/vae_kl": 0.0}
+
+        if w > 0:
+            z = post.sample()
+            recon = vae.decode(z).sample
+            rtype = str(self.cfg.vae_recon_type).lower()
+            if rtype == "l2":
+                r = F.mse_loss(recon, bev_in)
+            elif rtype == "l1":
+                r = F.l1_loss(recon, bev_in)
+            else:
+                raise ValueError("vae_recon_type must be l1 or l2")
+            total = total + r * w
+            logs["loss/vae_recon"] = float((r * w).detach().cpu())
+
+        if kw > 0:
+            kl = post.kl().mean()
+            total = total + kl * kw
+            logs["loss/vae_kl"] = float((kl * kw).detach().cpu())
+
+        return total, logs

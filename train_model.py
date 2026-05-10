@@ -245,13 +245,16 @@ def _validation_reconstruction(
     device: torch.device,
     num_inference_steps: int,
     collage_seed_offset: int = 0,
+    cfg_guidance_scale: float = 7.5,
+    use_cfg: bool = True,
 ) -> torch.Tensor:
     """
     Inference-only collage generation: diffuse from Gaussian latent noise down to denoised
     latents (same sampler as pretrained DDPM scheduler), conditioned on ControlNets +
     frozen UNet + text embeds — then VAE decode to BEV pixels.
 
-    This matches "random noise → full sampling" rather than one-step GT-based x0.
+    Optional classifier-free guidance: eps = eps_u + w * (eps_c - eps_u) with unconditional
+    forward using empty prompt + zero control (matches training dropout convention).
     """
     bev = batch["bev"]
     b, _, h_img, w_img = bev.shape
@@ -275,13 +278,34 @@ def _validation_reconstruction(
     for t in net.noise_scheduler.timesteps:
         ti = int(t.item()) if isinstance(t, torch.Tensor) else int(t)
         ts = torch.full((b,), ti, device=device, dtype=torch.long)
-        eps = net.predict_eps(
-            noisy_latents=latents,
-            timesteps=ts,
-            control_images=tup_ctrl,
-            control_scales=tup_scale,
-            view_ids=batch.get("view_ids"),
-        )
+        if use_cfg and float(cfg_guidance_scale) != 1.0:
+            eps_c = net.predict_eps(
+                noisy_latents=latents,
+                timesteps=ts,
+                control_images=tup_ctrl,
+                control_scales=tup_scale,
+                view_ids=batch.get("view_ids"),
+                force_empty_prompt=False,
+                force_zero_control=False,
+            )
+            eps_u = net.predict_eps(
+                noisy_latents=latents,
+                timesteps=ts,
+                control_images=tup_ctrl,
+                control_scales=tup_scale,
+                view_ids=batch.get("view_ids"),
+                force_empty_prompt=True,
+                force_zero_control=True,
+            )
+            eps = eps_u + float(cfg_guidance_scale) * (eps_c - eps_u)
+        else:
+            eps = net.predict_eps(
+                noisy_latents=latents,
+                timesteps=ts,
+                control_images=tup_ctrl,
+                control_scales=tup_scale,
+                view_ids=batch.get("view_ids"),
+            )
         latents = net.noise_scheduler.step(eps, ti, latents).prev_sample
 
     latents = (latents / net.vae.config.scaling_factor).to(dtype=torch.float32)
@@ -367,6 +391,7 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
             prompt=sd_cfg.get("prompt", "a high quality image"),
             local_files_only=bool(sd_cfg.get("local_files_only", False)),
             freeze_unet=bool(control_cfg.get("freeze_unet", True)),
+            train_vae=bool(sd_cfg.get("train_vae", False)),
             num_views=int(control_cfg.get("num_views", 6)),
             use_view_embed=bool(control_cfg.get("use_view_embed", True)),
             view_encoding=view_encoding,
@@ -375,6 +400,8 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
             view_attn_d_model=int(control_cfg.get("view_attn_d_model", 256)),
             view_attn_nhead=int(control_cfg.get("view_attn_nhead", 8)),
             view_attn_dropout=float(control_cfg.get("view_attn_dropout", 0.0)),
+            cfg_dropout_prompt_p=float(control_cfg.get("cfg_dropout_prompt_p", 0.125)),
+            cfg_dropout_control_p=float(control_cfg.get("cfg_dropout_control_p", 0.125)),
         ).to(device)
         print(f"[TRAIN] Model instance created, initializing (this may take 1-5 minutes)...", flush=True)
         net.initialize(device, n_controlnets=len(sources))
@@ -385,7 +412,30 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
         traceback.print_exc()
         raise
 
-    # ControlNet-only training: optimize ControlNet + optional view modules.
+    def _count_params(ps) -> int:
+        return int(sum(int(p.numel()) for p in ps))
+
+    trainable = [(n, p) for (n, p) in net.named_parameters() if p.requires_grad]
+    trainable_total = _count_params((p for _, p in trainable))
+    cn_params = _count_params(net.controlnets.parameters())
+    vae_params = _count_params(net.vae.parameters()) if any(p.requires_grad for p in net.vae.parameters()) else 0
+    view_params = 0
+    if getattr(net, "view_fusion_logits", None) is not None:
+        view_params += int(net.view_fusion_logits.numel())  # type: ignore[union-attr]
+    if getattr(net, "view_cross_attn", None) is not None:
+        view_params += _count_params(net.view_cross_attn.parameters())
+    if getattr(net, "view_embed", None) is not None:
+        view_params += _count_params(net.view_embed.parameters())
+
+    print(
+        "[TRAIN] Trainable parameters:",
+        f"total={trainable_total/1e6:.2f}M",
+        f"(controlnets≈{cn_params/1e6:.2f}M, view≈{view_params/1e6:.2f}M, vae≈{vae_params/1e6:.2f}M)",
+        flush=True,
+    )
+
+    # Optimize ControlNet + optional view modules (+ optional VAE finetune).
+    base_lr = float(optim_cfg["lr"])
     params = list(net.controlnets.parameters())
     if getattr(net, "view_fusion_logits", None) is not None:
         params.append(net.view_fusion_logits)  # type: ignore[arg-type]
@@ -393,12 +443,27 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
         params += list(net.view_cross_attn.parameters())
     if getattr(net, "view_embed", None) is not None:
         params += list(net.view_embed.parameters())  # type: ignore[union-attr]
+
+    wd = float(optim_cfg.get("weight_decay", 1e-2))
+    param_groups = [{"params": params, "lr": base_lr, "weight_decay": wd}]
+    if any(p.requires_grad for p in net.vae.parameters()):
+        vae_lr_mult = float(sd_cfg.get("vae_lr_mult", 0.1))
+        # VAE decoder often gets no gradients when only eps-loss is used; AdamW weight_decay
+        # would still shrink those weights and collapse decode() to ~grey. Disable WD on VAE.
+        param_groups.append(
+            {
+                "params": list(net.vae.parameters()),
+                "lr": base_lr * vae_lr_mult,
+                "weight_decay": float(sd_cfg.get("vae_weight_decay", 0.0)),
+            }
+        )
+
     opt = AdamW(
-        params,
-        lr=float(optim_cfg["lr"]),
+        param_groups,
         betas=tuple(optim_cfg.get("betas", [0.9, 0.999])),
         eps=float(optim_cfg.get("eps", 1e-8)),
-        weight_decay=float(optim_cfg.get("weight_decay", 1e-2)),
+        # Per-group weight_decay; use 0 here so global default does not override groups.
+        weight_decay=0.0,
     )
 
     losses = Losses(
@@ -410,6 +475,9 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
             x0_l1_weight=float(
                 loss_cfg.get("x0_l1_weight", loss_cfg.get("x0_fg_l1_weight", 0.0))
             ),
+            vae_recon_weight=float(loss_cfg.get("vae_recon_weight", 0.0)),
+            vae_recon_type=str(loss_cfg.get("vae_recon_type", "l1")),
+            vae_kl_weight=float(loss_cfg.get("vae_kl_weight", 0.0)),
         )
     )
 
@@ -421,6 +489,8 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
     save_every = int(log_cfg.get("save_every_steps", 1000))
     val_every = int(log_cfg.get("validate_every_steps", 500))
     collage_inference_steps = int(log_cfg.get("collage_inference_steps", 50))
+    use_cfg_validation = bool(log_cfg.get("use_cfg_validation", True))
+    cfg_guidance_scale = float(log_cfg.get("cfg_guidance_scale", 7.5))
 
     if writer is not None:
         writer.add_text("experiment/notes", str(exp.get("notes", "")), 0)
@@ -514,6 +584,15 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
                 loss = loss + l1_val
                 loss_logs.update(l1_logs)
 
+            vae_rw = float(loss_cfg.get("vae_recon_weight", 0.0))
+            vae_klw = float(loss_cfg.get("vae_kl_weight", 0.0))
+            if (vae_rw > 0 or vae_klw > 0) and getattr(net, "train_vae", False):
+                bev_in_vae = batch["bev"] * 2.0 - 1.0
+                with torch.autocast(device_type=device.type, enabled=False):
+                    vae_aux, vae_logs = losses.vae_recon_and_kl(net.vae, bev_in_vae)
+                loss = loss + vae_aux
+                loss_logs.update(vae_logs)
+
             loss = loss / grad_accum
 
         loss.backward()
@@ -554,6 +633,8 @@ def train_model(config_path: str = "config_experiment.yaml", *, resume: bool = F
                     device=device,
                     num_inference_steps=collage_inference_steps,
                     collage_seed_offset=seed + step,
+                    cfg_guidance_scale=cfg_guidance_scale,
+                    use_cfg=use_cfg_validation,
                 )
             _log_labeled_recon_collage(
                 writer,
