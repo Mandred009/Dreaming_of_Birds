@@ -6,3 +6,6 @@ runs
 __pycache__
 data.zip
 
+*.pyc
+*.pth
+*.ckpt
