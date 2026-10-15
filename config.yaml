@@ -1,0 +1,23 @@
+# Paths
+dataroot: ~/datasets/nuscenes
+version: v1.0-mini
+out_dir: ~/datasets/bev_cache      # outside the repo: cache is ~hundreds of MB
+
+# BEV grid, ego frame (x forward, y left). Row 0 = far forward, col 0 = far left.
+grid:
+  size: 200          # cells per side
+  resolution: 0.5    # metres per cell
+  x_range: [-50.0, 50.0]
+  y_range: [-50.0, 50.0]
+
+# Sparse-BEV point filtering
+points:
+  stride: 4          # use every 4th pixel in u and v
+  max_depth: 50.0    # metres
+  z_range: [-1.0, 3.0]   # ego-frame height, drops ground noise below and sky/tall junk above
+
+# Pretrained models (HuggingFace)
+depth_model: depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf
+seg_model: nvidia/segformer-b2-finetuned-cityscapes-1024-1024
+
+cameras: [CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT]
