@@ -12,17 +12,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
 
-# RGB colours per class. Target: bg, vehicle, pedestrian. Sparse: flat, vehicle, person, obstacle.
-TARGET_COLORS = np.array([[0, 0, 0], [255, 60, 60], [60, 255, 60]], dtype=np.uint8)
-SPARSE_COLORS = np.array([[120, 120, 120], [255, 60, 60], [60, 255, 60], [80, 120, 255]], dtype=np.uint8)
-
-
-def sparse_to_rgb(sparse):
-    """Paint classes in order flat -> obstacle -> vehicle -> person so small/important ones stay on top."""
-    img = np.zeros(sparse.shape[1:] + (3,), dtype=np.uint8)
-    for c in [0, 3, 1, 2]:
-        img[sparse[c] > 0] = SPARSE_COLORS[c]
-    return img
+from viz import TARGET_COLORS, sparse_to_rgb
 
 
 def main(token, out_path):

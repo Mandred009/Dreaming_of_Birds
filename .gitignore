@@ -10,3 +10,4 @@ data.zip
 *.pth
 *.ckpt
 *.log
+checkpoints/
