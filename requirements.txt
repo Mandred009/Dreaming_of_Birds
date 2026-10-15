@@ -9,3 +9,5 @@ tqdm
 matplotlib
 pillow
 tensorboard
+diffusers
+accelerate

@@ -52,3 +52,21 @@ train:
 eval:
   results_dir: results
   num_qualitative: 4
+
+# Diffusion (model C): Stable Diffusion 1.5 + ControlNet. Only the ControlNet is trained.
+diffusion:
+  base_model: runwayml/stable-diffusion-v1-5
+  prompt: "a bird's-eye-view semantic map"   # fixed, so no classifier-free guidance
+  image_size: 256          # class map is resized 200 -> 256 so the VAE latent is 32x32
+  seed: 0
+  lr: 0.0001               # 1e-5 (usual ControlNet value) had not started using the control input after 2000 steps
+  batch_size: 8
+  grad_accum: 1
+  shift_prob: 0.5          # augmentation: chance of shifting a frame by a multiple of 25 BEV cells
+  point_keep_min: 0.5      # augmentation: each frame keeps a random 50-100% of its sparse points
+  max_steps: 14000         # optimizer steps of the final run 
+  eval_every: 1000
+  ddim_steps: 25           # sampling steps used for validation and inference
+  vote_samples: 4          # samples per frame for the majority-vote row
+  ckpt_dir: checkpoints/diffusion
+  log_dir: runs/diffusion

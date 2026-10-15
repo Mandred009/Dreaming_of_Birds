@@ -47,6 +47,25 @@ def make_unet_method(cfg, device="cuda"):
     return predict
 
 
+def load_diffusion(cfg):
+    """Model C: SD 1.5 + the trained ControlNet (checkpoints/diffusion/best).
+    Returns None if there is no checkpoint yet."""
+    path = os.path.join(cfg["diffusion"]["ckpt_dir"], "best")
+    if not os.path.isdir(path):
+        return None
+    from diffusers import ControlNetModel
+    from models.diffusion import BEVDiffusion, encode_prompt
+    model = BEVDiffusion(cfg, encode_prompt(cfg))
+    model.controlnet = ControlNetModel.from_pretrained(path).to("cuda")   # swap in trained weights
+    return model.eval()
+
+
+def run_diffusion(model, sparse_all, num_samples, bs=4):
+    """Predict all frames in small batches (each frame needs num_samples x 25 UNet passes)."""
+    return np.concatenate([model.predict(torch.from_numpy(sparse_all[i:i + bs]), num_samples, seed=i).cpu().numpy()
+                           for i in range(0, len(sparse_all), bs)])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
@@ -59,6 +78,16 @@ def main():
                ("B: U-Net", make_unet_method(cfg))]
 
     preds = {name: np.stack([fn(s) for s in val.sparse]) for name, fn in methods}
+
+    # Model C: loaded only if a checkpoint exists; 1 sample and k-sample vote; freed afterwards.
+    model = load_diffusion(cfg)
+    if model is not None:
+        k_vote = cfg["diffusion"]["vote_samples"]
+        for name, k in [("C: diffusion (1 sample)", 1), (f"C: diffusion ({k_vote}-sample vote)", k_vote)]:
+            preds[name] = run_diffusion(model, val.sparse, k)
+            methods.append((name, None))
+        del model
+        torch.cuda.empty_cache()
 
     lines = ["| Method | Vehicle IoU | Pedestrian IoU | mIoU |", "|---|---|---|---|"]
     for name, _ in methods:
@@ -88,6 +117,21 @@ def main():
                 axes[r, c].set_title(title)
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, "qualitative_unet.png"), dpi=70)
+
+    # Qualitative figure with diffusion: sparse | U-Net | diffusion | target.
+    if "C: diffusion (1 sample)" in preds:
+        cols = ["sparse input", "U-Net", "diffusion (1 sample)", "target"]
+        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
+        for r, i in enumerate(ids):
+            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
+                    label_to_rgb(preds["C: diffusion (1 sample)"][i]), label_to_rgb(val.target[i])]
+            for c, (img, title) in enumerate(zip(imgs, cols)):
+                axes[r, c].imshow(img)
+                axes[r, c].axis("off")
+                if r == 0:
+                    axes[r, c].set_title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "qualitative_diffusion.png"), dpi=70)
 
 
 if __name__ == "__main__":
