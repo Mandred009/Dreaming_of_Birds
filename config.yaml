@@ -70,3 +70,22 @@ diffusion:
   vote_samples: 4          # samples per frame for the majority-vote row
   ckpt_dir: checkpoints/diffusion
   log_dir: runs/diffusion
+
+# Pixel-space conditional diffusion (model D, E4): same U-Net backbone as B, trained from scratch.
+# Input = concat(noisy class map [3ch], sparse BEV [4ch]); backbone widths come from `unet.channels`.
+pixel_diffusion:
+  T: 1000                  # number of training noise levels
+  time_dim: 128            # size of the timestep embedding
+  ddim_steps: 20           # sampling steps (validation and inference)
+  num_samples: 4           # samples per frame for the "mean" row (softmax probabilities averaged)
+  seed: 0
+  epochs: 300
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  val_every: 10            # epochs between validation runs (each is a full 20-step DDIM sampling)
+  patience: 8              # early stop after this many validations without val mIoU improvement
+  num_workers: 2
+  ckpt_dir: checkpoints/pixel_diffusion
+  log_dir: runs/pixel_diffusion

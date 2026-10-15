@@ -7,3 +7,5 @@ mIoU = mean of vehicle and pedestrian IoU, on test = mini_val (81 samples)
 | B: U-Net | 0.151 | 0.041 | 0.096 |
 | C: diffusion (1 sample) | 0.037 | 0.001 | 0.019 |
 | C: diffusion (4-sample vote) | 0.003 | 0.000 | 0.001 |
+| D: pixel diffusion (1 sample) | 0.117 | 0.007 | 0.062 |
+| D: pixel diffusion (4-sample mean) | 0.129 | 0.002 | 0.066 |

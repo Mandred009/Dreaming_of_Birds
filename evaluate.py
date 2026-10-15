@@ -66,6 +66,27 @@ def run_diffusion(model, sparse_all, num_samples, bs=4):
                            for i in range(0, len(sparse_all), bs)])
 
 
+def load_pixel_diffusion(cfg, device="cuda"):
+    """Model D (E4): the trained pixel-space denoiser. None if there is no checkpoint yet."""
+    path = os.path.join(cfg["pixel_diffusion"]["ckpt_dir"], "best.pt")
+    if not os.path.exists(path):
+        return None
+    from models.unet import build_denoiser
+    model = build_denoiser(cfg).to(device)
+    model.load_state_dict(torch.load(path, map_location=device))
+    return model.eval()
+
+
+def run_pixel_diffusion(model, cfg, sparse_all, num_samples, bs=16):
+    from models.pixel_diffusion import cosine_alpha_bar, predict
+    p = cfg["pixel_diffusion"]
+    alpha_bar = cosine_alpha_bar(p["T"]).cuda()
+    gen = torch.Generator(device="cuda").manual_seed(p["seed"])
+    return np.concatenate([predict(model, torch.from_numpy(sparse_all[i:i + bs]).float().cuda(), alpha_bar,
+                                   p["ddim_steps"], num_samples, gen).cpu().numpy()
+                           for i in range(0, len(sparse_all), bs)])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
@@ -85,6 +106,16 @@ def main():
         k_vote = cfg["diffusion"]["vote_samples"]
         for name, k in [("C: diffusion (1 sample)", 1), (f"C: diffusion ({k_vote}-sample vote)", k_vote)]:
             preds[name] = run_diffusion(model, val.sparse, k)
+            methods.append((name, None))
+        del model
+        torch.cuda.empty_cache()
+
+    # Model D: pixel diffusion; 1 sample and k-sample mean of softmax probabilities.
+    model = load_pixel_diffusion(cfg)
+    if model is not None:
+        k_mean = cfg["pixel_diffusion"]["num_samples"]
+        for name, k in [("D: pixel diffusion (1 sample)", 1), (f"D: pixel diffusion ({k_mean}-sample mean)", k_mean)]:
+            preds[name] = run_pixel_diffusion(model, cfg, val.sparse, k)
             methods.append((name, None))
         del model
         torch.cuda.empty_cache()
@@ -132,6 +163,21 @@ def main():
                     axes[r, c].set_title(title)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "qualitative_diffusion.png"), dpi=70)
+
+    # Qualitative figure with pixel diffusion: sparse | U-Net | pixel diffusion | target.
+    if "D: pixel diffusion (1 sample)" in preds:
+        cols = ["sparse input", "U-Net", "pixel diffusion (1 sample)", "target"]
+        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
+        for r, i in enumerate(ids):
+            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
+                    label_to_rgb(preds["D: pixel diffusion (1 sample)"][i]), label_to_rgb(val.target[i])]
+            for c, (img, title) in enumerate(zip(imgs, cols)):
+                axes[r, c].imshow(img)
+                axes[r, c].axis("off")
+                if r == 0:
+                    axes[r, c].set_title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "qualitative_pixel_diffusion.png"), dpi=70)
 
 
 if __name__ == "__main__":
