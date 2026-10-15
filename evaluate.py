@@ -66,11 +66,17 @@ def run_diffusion(model, sparse_all, num_samples, bs=4):
                            for i in range(0, len(sparse_all), bs)])
 
 
-def load_pixel_diffusion(cfg, device="cuda"):
-    """Model D (E4): the trained pixel-space denoiser. None if there is no checkpoint yet."""
-    path = os.path.join(cfg["pixel_diffusion"]["ckpt_dir"], "best.pt")
+def load_pixel_diffusion(cfg, device="cuda", refiner=False):
+    """Model D (E4) or, with refiner=True, model E (E5): the trained pixel-space denoiser.
+    None if there is no checkpoint yet."""
+    p = cfg["pixel_diffusion"]
+    path = os.path.join(p["refiner_ckpt_dir" if refiner else "ckpt_dir"], "best.pt")
     if not os.path.exists(path):
         return None
+    if refiner:
+        import copy
+        cfg = copy.deepcopy(cfg)
+        cfg["pixel_diffusion"]["condition_on_unet"] = True   # 10-channel input
     from models.unet import build_denoiser
     model = build_denoiser(cfg).to(device)
     model.load_state_dict(torch.load(path, map_location=device))
@@ -116,6 +122,18 @@ def main():
         k_mean = cfg["pixel_diffusion"]["num_samples"]
         for name, k in [("D: pixel diffusion (1 sample)", 1), (f"D: pixel diffusion ({k_mean}-sample mean)", k_mean)]:
             preds[name] = run_pixel_diffusion(model, cfg, val.sparse, k)
+            methods.append((name, None))
+        del model
+        torch.cuda.empty_cache()
+
+    # Model E (E5): diffusion refiner conditioned on B's softmax. Its condition = sparse + B probs.
+    model = load_pixel_diffusion(cfg, refiner=True)
+    if model is not None:
+        from models.pixel_diffusion import add_unet_probs
+        cond = add_unet_probs(cfg, val.sparse)
+        k_mean = cfg["pixel_diffusion"]["num_samples"]
+        for name, k in [("E: diffusion refiner on U-Net (1 sample)", 1), (f"E: diffusion refiner on U-Net ({k_mean}-sample mean)", k_mean)]:
+            preds[name] = run_pixel_diffusion(model, cfg, cond, k)
             methods.append((name, None))
         del model
         torch.cuda.empty_cache()
@@ -178,6 +196,21 @@ def main():
                     axes[r, c].set_title(title)
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "qualitative_pixel_diffusion.png"), dpi=70)
+
+    # Qualitative figure with the refiner: sparse | U-Net | refiner | target.
+    if "E: diffusion refiner on U-Net (1 sample)" in preds:
+        cols = ["sparse input", "U-Net", "refiner (1 sample)", "target"]
+        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
+        for r, i in enumerate(ids):
+            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
+                    label_to_rgb(preds["E: diffusion refiner on U-Net (1 sample)"][i]), label_to_rgb(val.target[i])]
+            for c, (img, title) in enumerate(zip(imgs, cols)):
+                axes[r, c].imshow(img)
+                axes[r, c].axis("off")
+                if r == 0:
+                    axes[r, c].set_title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "qualitative_refiner.png"), dpi=70)
 
 
 if __name__ == "__main__":

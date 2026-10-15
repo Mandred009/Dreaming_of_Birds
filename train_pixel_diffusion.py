@@ -1,4 +1,4 @@
-"""Train the pixel-space conditional diffusion model (E4).
+"""Train the pixel-space conditional diffusion model (E4), or with --refiner the E5 variant.
 Usage: python train_pixel_diffusion.py --config config.yaml [--epochs N] [--probe]
 --probe: no training; load best.pt and print one-step x0 IoU at t=50 and t=999 on train/val/test."""
 import argparse
@@ -7,14 +7,30 @@ import time
 import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import BEVDataset
 from metrics import confusion_matrix, summarize
-from models.pixel_diffusion import cosine_alpha_bar, denoise_loss, predict, predict_x0_once
+from models.pixel_diffusion import add_unet_probs, cosine_alpha_bar, denoise_loss, predict, predict_x0_once
 from models.unet import build_denoiser
 from train import class_weights, make_loss, seed_everything   # same loss as baseline B
+
+
+class CondDataset(Dataset):
+    """E5 training data: cond [N,7,H,W] float (sparse + B's probs) with the same left-right flip
+    augmentation as BEVDataset; the probabilities are flipped together with sparse and target."""
+    def __init__(self, cond, target, augment):
+        self.cond, self.target, self.augment = cond, target, augment
+
+    def __len__(self):
+        return len(self.cond)
+
+    def __getitem__(self, i):
+        c, y = self.cond[i], self.target[i]
+        if self.augment and np.random.rand() < 0.5:
+            c, y = c[:, :, ::-1], y[:, ::-1]
+        return torch.from_numpy(np.ascontiguousarray(c)).float(), torch.from_numpy(np.ascontiguousarray(y)).long()
 
 
 @torch.no_grad()
@@ -49,27 +65,38 @@ def main():
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--epochs", type=int, default=None, help="override config (smoke test)")
     ap.add_argument("--probe", action="store_true")
+    ap.add_argument("--refiner", action="store_true", help="E5: also condition on B's softmax; separate ckpt/log dirs")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
     p, t = cfg["pixel_diffusion"], cfg["train"]
+    if args.refiner:
+        p["condition_on_unet"] = True
+        p["ckpt_dir"], p["log_dir"] = p["refiner_ckpt_dir"], p["refiner_log_dir"]
     epochs = args.epochs or p["epochs"]
     seed_everything(p["seed"])
     device = "cuda"
 
-    train_ds = BEVDataset(cfg, "train", augment=True)
-    val_ds = BEVDataset(cfg, "val", augment=False)
+    def load(split, augment):
+        ds = BEVDataset(cfg, split, augment=augment)
+        if args.refiner:
+            ds.sparse = add_unet_probs(cfg, ds.sparse)   # [N,7,H,W] float: sparse + B's softmax
+        return ds
+    train_ds = load("train", True)
+    val_ds = load("val", False)
     alpha_bar = cosine_alpha_bar(p["T"]).to(device)
     model = build_denoiser(cfg).to(device)
 
     if args.probe:
         model.load_state_dict(torch.load(os.path.join(p["ckpt_dir"], "best.pt"), map_location=device))
         for name in ["train", "val", "test"]:
-            ds = BEVDataset(cfg, name, augment=False)
+            ds = load(name, False)
             for tv in (50, 999):
                 m = probe(model, ds, alpha_bar, tv, device)
                 print(f"{name:5s} t={tv:3d}: veh {m['vehicle']:.3f} ped {m['pedestrian']:.3f} mIoU {m['miou']:.3f}")
         return
 
+    if args.refiner:
+        train_ds = CondDataset(train_ds.sparse, train_ds.target, augment=True)
     train_dl = DataLoader(train_ds, p["batch_size"], shuffle=True, num_workers=p["num_workers"], drop_last=True)
     print(f"train {len(train_ds)} samples, val {len(val_ds)} samples")
 

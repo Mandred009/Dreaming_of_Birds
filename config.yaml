@@ -89,3 +89,8 @@ pixel_diffusion:
   num_workers: 2
   ckpt_dir: checkpoints/pixel_diffusion
   log_dir: runs/pixel_diffusion
+  # E5 (refiner): also feed B's softmax probabilities (3 more input channels). Off for E4. Enabled by
+  # `train_pixel_diffusion.py --refiner`, which also switches to the two dirs below (E4 files untouched).
+  condition_on_unet: false
+  refiner_ckpt_dir: checkpoints/pixel_diffusion_refiner
+  refiner_log_dir: runs/pixel_diffusion_refiner

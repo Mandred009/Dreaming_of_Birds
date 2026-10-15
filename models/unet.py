@@ -87,6 +87,7 @@ def build_denoiser(cfg):
     """E4 denoiser: the SAME backbone widths as B, but 7 input channels (3 noisy-map + 4 sparse)
     and a timestep embedding. Output: 3 channels = class logits for the clean map."""
     p = cfg["pixel_diffusion"]
-    model = UNet(3 + cfg["unet"]["in_channels"], cfg["unet"]["num_classes"], cfg["unet"]["channels"], time_dim=p["time_dim"])
+    extra = cfg["unet"]["num_classes"] if p.get("condition_on_unet") else 0   # E5: + B's softmax probs
+    model = UNet(3 + cfg["unet"]["in_channels"] + extra, cfg["unet"]["num_classes"], cfg["unet"]["channels"], time_dim=p["time_dim"])
     print(f"Denoiser parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
     return model

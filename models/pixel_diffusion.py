@@ -93,3 +93,22 @@ def predict(model, sparse, alpha_bar, steps=20, num_samples=1, generator=None):
     differently, a hard vote erases them, while averaged probabilities keep the likely ones."""
     probs = sum(ddim_sample(model, sparse, alpha_bar, steps, generator) for _ in range(num_samples)) / num_samples
     return probs.argmax(1)
+
+
+@torch.no_grad()
+def add_unet_probs(cfg, sparse, device="cuda", bs=16):
+    """E5 condition: sparse uint8 [N,4,H,W] numpy -> float32 [N,7,H,W] = concat(sparse, softmax of the
+    frozen baseline-B U-Net). The denoiser code above is unchanged: it just receives these 7 channels
+    wherever E4 passed the 4-channel `sparse`. Computed once per dataset and kept in memory.
+    Caveat: B was trained on the train frames, so its probabilities there are better than on val/test
+    (train/test mismatch for stacked models); the refiner learns to trust them more than it should."""
+    import os
+    from models.unet import build_unet
+    unet = build_unet(cfg).to(device)
+    unet.load_state_dict(torch.load(os.path.join(cfg["train"]["ckpt_dir"], "best.pt"), map_location=device))
+    unet.eval()
+    out = []
+    for i in range(0, len(sparse), bs):
+        x = torch.from_numpy(sparse[i:i + bs]).float().to(device)
+        out.append(torch.cat([x, F.softmax(unet(x), dim=1)], dim=1).cpu())
+    return torch.cat(out).numpy()
