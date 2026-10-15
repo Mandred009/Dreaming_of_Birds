@@ -8,10 +8,27 @@ from torch.utils.data import Dataset
 
 class BEVDataset(Dataset):
     def __init__(self, cfg, split, augment=False):
-        """split: 'train' or 'val' (index.csv says mini_train / mini_val in the split column)."""
+        """split: 'train', 'val' or 'test'.
+
+        The split mapping lives here and only here. index.csv labels frames mini_train/mini_val
+        (called 'train'/'val' there). Selecting the best checkpoint and early stopping on the
+        same split we report would leak the test set into model selection. So:
+          train = index 'train' minus the held-out scene cfg['data']['val_scene']
+          val   = that held-out scene (model selection / early stopping, used by train.py)
+          test  = index 'val' = mini_val (reported numbers only, used by evaluate.py)
+        """
         out_dir = os.path.expanduser(cfg["out_dir"])
+        val_scene = cfg["data"]["val_scene"]
         with open(os.path.join(out_dir, "index.csv")) as f:
-            rows = [r for r in csv.DictReader(f) if r["split"] == split]
+            all_rows = list(csv.DictReader(f))
+        if split == "test":
+            rows = [r for r in all_rows if r["split"] == "val"]
+        elif split == "val":
+            rows = [r for r in all_rows if r["split"] == "train" and r["scene_name"] == val_scene]
+        elif split == "train":
+            rows = [r for r in all_rows if r["split"] == "train" and r["scene_name"] != val_scene]
+        else:
+            raise ValueError(f"unknown split {split!r}")
         sparse, target = [], []
         for r in rows:
             d = np.load(os.path.join(out_dir, r["token"] + ".npz"))

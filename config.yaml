@@ -22,6 +22,12 @@ seg_model: nvidia/segformer-b2-finetuned-cityscapes-1024-1024
 
 cameras: [CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, CAM_BACK_RIGHT]
 
+# Data split (by scene). train = mini_train minus val_scene; val = val_scene (model selection);
+# test = mini_val (reported only). scene-0655 is daytime with the most vehicle pixels in mini_train,
+# but few pedestrians (~10 px/frame), so val pedestrian IoU is noisy.
+data:
+  val_scene: scene-0655
+
 # U-Net baseline
 unet:
   in_channels: 4

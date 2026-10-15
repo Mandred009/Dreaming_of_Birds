@@ -1,4 +1,4 @@
-"""Evaluate baselines on mini_val.  Usage: python evaluate.py --config config.yaml
+"""Evaluate baselines on the test split (= mini_val).  Usage: python evaluate.py --config config.yaml
 
 Every method is a function  sparse [4,H,W] uint8 numpy -> prediction [H,W] int in {0,1,2}.
 To add a method later (e.g. diffusion), write such a function and add it to METHODS.
@@ -51,7 +51,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     cfg = yaml.safe_load(open(ap.parse_args().config))
-    val = BEVDataset(cfg, "val", augment=False)
+    val = BEVDataset(cfg, "test", augment=False)
 
     # (name, function). Hook: append e.g. ("Diffusion", make_diffusion_method(cfg)) here.
     methods = [("A: projection only", projection_only),
@@ -70,9 +70,9 @@ def main():
     out_dir = cfg["eval"]["results_dir"]
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.md"), "w") as f:
-        f.write(f"mIoU = mean of vehicle and pedestrian IoU, on mini_val ({len(val)} samples)\n\n{table}\n")
+        f.write(f"mIoU = mean of vehicle and pedestrian IoU, on test = mini_val ({len(val)} samples)\n\n{table}\n")
 
-    # Qualitative figure: evenly spaced val samples; columns = sparse | each method | target.
+    # Qualitative figure: evenly spaced test samples; columns = sparse | each method | target.
     k = cfg["eval"]["num_qualitative"]
     ids = np.linspace(0, len(val) - 1, k).astype(int)
     names = [n for n, _ in methods if n in ("A: projection only", "B: U-Net")] or [methods[0][0]]

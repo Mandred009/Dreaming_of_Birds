@@ -77,7 +77,7 @@ def main():
     val_ds = BEVDataset(cfg, "val", augment=False)
     train_dl = DataLoader(train_ds, t["batch_size"], shuffle=True, num_workers=t["num_workers"], drop_last=True)
     val_dl = DataLoader(val_ds, t["batch_size"], shuffle=False, num_workers=t["num_workers"])
-    print(f"train {len(train_ds)} samples, val {len(val_ds)} samples")
+    print(f"train {len(train_ds)} samples, val {len(val_ds)} samples (held-out scene {cfg['data']['val_scene']}; test = mini_val is not used here)")
 
     weights, freq = class_weights(train_ds.target, cfg["unet"]["num_classes"])
     print("class freq", freq.round(5), "-> CE weights", weights.numpy().round(3))
