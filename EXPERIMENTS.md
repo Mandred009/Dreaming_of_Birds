@@ -36,7 +36,7 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 - **Diagnosis:** outputs are realistic, crisp car boxes but placed in the wrong places. One-step x0 prediction: veh 0.49 on train frames vs 0.002 on test → the ControlNet memorises 282 training frames instead of learning sparse→BEV geometry. ControlNet conditioning (zero-init residuals into a frozen natural-image UNet) is too weak a pathway for this little data.
 - **Takeaway:** learned the *look* of BEV maps, not the *where*. Needs a stronger conditioning path and far fewer parameters — see E4.
 
-## E4 — Pixel-space conditional diffusion, same U-Net backbone as B (2026-10-15, commit TBD)
+## E4 — Pixel-space conditional diffusion, same U-Net backbone as B (2026-10-15, commit 849defd)
 - Setup: Palette/SR3 style, trained from scratch. x0 = one-hot target in {-1,+1}; denoiser input = concat(noisy map 3ch, sparse 4ch) = 7 ch; output 3 channels = x0 class logits. Backbone = B's U-Net (widths 32-64-128-256) + sinusoidal timestep embedding → MLP → per-channel bias in every conv block (2.05M params; B's code path/checkpoint unchanged). Hand-written cosine schedule (T=1000), q_sample, DDIM (20 steps, eta=0, from pure noise). Loss = B's weighted CE + Dice on the x0 logits. AdamW lr 1e-3 cosine, batch 16, flip, 300 epochs; validation (full 20-step DDIM) every 10 epochs on scene-0655, best by val mIoU.
 - Cost: 6.7 min training, 2.0 GB VRAM (peak allocated).
 - **Result (test):** 1 sample veh **0.117** / ped 0.007 / mIoU **0.062**; 4-sample mean-of-softmax veh 0.129 / ped 0.002 / mIoU 0.066. (B: 0.151 / 0.041 / 0.096; E3: 0.019.) Best val mIoU 0.067 (epoch 230); val curve is noisy (0.01-0.07), ped val IoU 0 throughout.
