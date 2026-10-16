@@ -12,14 +12,16 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from nuscenes.nuscenes import NuScenes
 
+from dataset import dataset_cfg
 from viz import TARGET_COLORS, sparse_to_rgb
 
 
 def main(token, out_path):
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "config.yaml")))
-    dataroot = os.path.expanduser(cfg["dataroot"])
-    data = np.load(os.path.join(os.path.expanduser(cfg["out_dir"]), token + ".npz"))
-    nusc = NuScenes(version=cfg["version"], dataroot=dataroot, verbose=False)
+    dcfg = dataset_cfg(cfg)
+    dataroot = os.path.expanduser(dcfg["dataroot"])
+    data = np.load(os.path.join(os.path.expanduser(dcfg["out_dir"]), token + ".npz"))
+    nusc = NuScenes(version=dcfg["version"], dataroot=dataroot, verbose=False)
     sample = nusc.get("sample", token)
 
     fig, axes = plt.subplots(3, 3, figsize=(18, 14))

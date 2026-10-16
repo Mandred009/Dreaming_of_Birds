@@ -12,11 +12,12 @@ from PIL import Image
 from pyquaternion import Quaternion
 from tqdm import tqdm
 from nuscenes.nuscenes import NuScenes
-from nuscenes.utils.splits import mini_train, mini_val
+from nuscenes.utils.splits import mini_train, mini_val, train as nusc_train, val as nusc_val
 from transformers import (AutoImageProcessor, AutoModelForDepthEstimation,
                           SegformerImageProcessor, SegformerForSemanticSegmentation)
 
 import bev_geometry as geo
+from dataset import dataset_cfg
 
 
 def transform_matrix(translation, rotation):
@@ -71,21 +72,43 @@ def predict_seg(model, processor, image, device):
 
 def main():
     cfg = yaml.safe_load(open(os.path.join(os.path.dirname(__file__), "config.yaml")))
-    dataroot = os.path.expanduser(cfg["dataroot"])
-    out_dir = os.path.expanduser(cfg["out_dir"])
+    dcfg = dataset_cfg(cfg)
+    dataroot = os.path.expanduser(dcfg["dataroot"])
+    out_dir = os.path.expanduser(dcfg["out_dir"])
     os.makedirs(out_dir, exist_ok=True)
     grid, pcfg = cfg["grid"], cfg["points"]
     device = "cuda"
 
-    nusc = NuScenes(version=cfg["version"], dataroot=dataroot, verbose=False)
+    nusc = NuScenes(version=dcfg["version"], dataroot=dataroot, verbose=False)
     depth_proc = AutoImageProcessor.from_pretrained(cfg["depth_model"])
     depth_model = AutoModelForDepthEstimation.from_pretrained(cfg["depth_model"]).half().to(device).eval()
     seg_proc = SegformerImageProcessor.from_pretrained(cfg["seg_model"])
     seg_model = SegformerForSemanticSegmentation.from_pretrained(cfg["seg_model"]).half().to(device).eval()
 
-    train_scenes, val_scenes = set(mini_train), set(mini_val)
+    if cfg.get("dataset", "mini") == "mini":
+        train_scenes, val_scenes = set(mini_train), set(mini_val)
+    else:
+        train_scenes, val_scenes = set(nusc_train), set(nusc_val)   # official nuScenes split
+
+    def has_images(sample):
+        return all(os.path.exists(os.path.join(dataroot, nusc.get("sample_data", sample["data"][c])["filename"]))
+                   for c in cfg["cameras"])
+
+    # A scene is usable only if all 6 camera images of ALL its keyframes are on disk.
+    usable = {}
+    for scene in nusc.scene:
+        tok, ok = scene["first_sample_token"], True
+        while tok:
+            s = nusc.get("sample", tok)
+            ok = ok and has_images(s)
+            tok = s["next"]
+        usable[scene["token"]] = ok
+    samples = [s for s in nusc.sample if usable[s["scene_token"]]]
+    print(f"usable scenes {sum(usable.values())}/{len(usable)}; usable frames {len(samples)}/{len(nusc.sample)}"
+          f" (skipped {len(nusc.sample) - len(samples)})", flush=True)
+
     rows = []
-    for sample in tqdm(nusc.sample):
+    for sample in tqdm(samples):
         scene_name = nusc.get("scene", sample["scene_token"])["name"]
         split = "train" if scene_name in train_scenes else "val" if scene_name in val_scenes else "other"
         rows.append((sample["token"], scene_name, split))

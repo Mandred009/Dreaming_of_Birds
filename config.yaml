@@ -1,4 +1,8 @@
-# Paths
+# Dataset switch: 'mini' uses the top-level dataroot/version/out_dir/data below (original behaviour);
+# 'trainval' uses the `trainval` block (dataset.dataset_cfg picks the right one).
+dataset: trainval
+
+# Paths (mini)
 dataroot: ~/datasets/nuscenes
 version: v1.0-mini
 out_dir: ~/datasets/bev_cache      # outside the repo: cache is ~hundreds of MB
@@ -27,6 +31,17 @@ cameras: [CAM_FRONT, CAM_FRONT_LEFT, CAM_FRONT_RIGHT, CAM_BACK, CAM_BACK_LEFT, C
 # but few pedestrians (~10 px/frame), so val pedestrian IoU is noisy.
 data:
   val_scene: scene-0655
+
+# nuScenes v1.0-trainval, only the scenes whose camera images exist locally (blob parts 01-04).
+# test = official val scenes available (reported only); val = seeded val_fraction of the available
+# official-train scenes (model selection); train = the rest.
+trainval:
+  dataroot: ~/datasets/nuscenes_trainval
+  version: v1.0-trainval
+  out_dir: ~/datasets/bev_cache_trainval
+  data:
+    val_fraction: 0.08
+    val_seed: 0
 
 # U-Net baseline
 unet:
