@@ -50,3 +50,29 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 - **Probe (one-step x0 mIoU):** t=50 train/val/test ~1.0; t=999: train 0.244 (veh 0.452) / val 0.093 (veh 0.186) / test 0.070 (veh 0.137, ped 0.003). Versus E4 t=999 test veh 0.102.
 - **B train vs test mIoU (the stacking mismatch):** train 0.275 (veh 0.414 / ped 0.137), val 0.112 (0.203 / 0.021), test 0.096 (0.151 / 0.041). B is ~3x better on its own training frames, so the refiner learns to trust B more than it should; its t=999 probe shows the same train/test gap (0.244 vs 0.070).
 - **Takeaway:** conditioning on B recovers most of the E4 deficit (mIoU 0.062 -> 0.076, veh 0.117 -> 0.136) but does not beat B itself (0.096); the refiner mostly copies B's placement, drops some of B's blobs and loses most pedestrians. Differences of ~0.01 are within the noise of 81 test frames / one seed. Train/test mismatch is likely the limiter; fixing it would need out-of-fold B predictions (e.g. scene-wise K-fold), not run here.
+
+---
+# v2: full BEV (map + objects) on nuScenes trainval
+
+## E6 — Data v2 (2026-10-15, commit e8c9c86)
+- Goal change: predict the *whole* BEV from 6 cameras, not just objects. Data: trainval camera blobs 01-04 (keyframes only), 340 scenes, 13,529 frames. Split by scene: test = official val scenes (1,982 frames), val = seeded 8% of train scenes (919), train 10,628.
+- Sparse input v2: 6 ch (road, sidewalk, terrain, vehicle, person, obstacle) from Depth-Anything-V2 metric depth + SegFormer-B2 Cityscapes, same unprojection as v1.
+- Target v2: multi-label 6 layers — drivable_area, ped_crossing, walkway, divider (road+lane dividers, dilated) from the nuScenes map expansion v1.3, plus vehicle / pedestrian boxes. Loss for all models: BCE with per-layer pos_weight (sqrt neg/pos) + soft Dice. Metric: per-layer IoU at 0.5; map_mIoU = layers 0-3, obj_mIoU = 4-5.
+- Cost: preprocessing several hours (GPU, finished 00:55 on 2026-10-16), map targets 39 min (CPU). Cache 162M, DINOv2 features 6.8G.
+
+## E7 — B v2: U-Net on trainval (2026-10-16, commit 1ae7e82)
+- Same 1.9M U-Net, 6-ch in / 6-ch out. 39 epochs (early stop), 29.5 min, 1.7 GB VRAM. Best val mIoU 0.262.
+- **Result (test):** map 0.316 / obj 0.148 / **mIoU 0.260** (drivable 0.591, vehicle 0.232, pedestrian 0.064).
+- **Takeaway:** ~38x more data lifts vehicle IoU from 0.151 (mini v1) to 0.232. Val loss rises from epoch ~12 while IoU still creeps up (overconfident, not worse). Road layout is blobby: lanes and crossings are guessed only where the sparse input shows them.
+
+## E8 — D v2: pixel diffusion on trainval (2026-10-16, commit 1ae7e82)
+- E4 denoiser ported to 6 multi-label layers (x0 in {-1,+1}, x0-logit BCE+Dice loss), 80 epochs, 66 min, 2.1 GB. Best val mIoU 0.165.
+- **Result (test):** 1 sample mIoU 0.170; 4-sample mean **0.177** (map 0.222 / obj 0.088).
+- **Takeaway:** still clearly below B with the same backbone and data — the E4 conclusion holds at 38x the data. Concatenation conditioning in a 2M U-Net is not enough.
+
+## E9 — F: hybrid DiT with camera cross-attention (2026-10-16, commit 1ae7e82)
+- DiT-S style (45.6M params, hidden 384, depth 12, 6 heads, 8x8 patches -> 625 BEV tokens, adaLN-Zero). BEV tokens = patchified concat(x_t, sparse). Each block: self-attn -> cross-attn to 672 camera tokens (frozen DINOv2-small 16x28 grid pooled 2x per camera + PETR-style ray MLP (camera centre + ray direction in ego) + camera-id embedding) -> MLP. Cosine schedule, x0-logit BCE+Dice, EMA, grad clip 1, no flip (would break camera geometry). 60 epochs, 92 min, 4.2 GB peak. DINOv2 features precomputed (37 min, fp16).
+- **Result (test):** 1 sample mIoU 0.310; 4-sample mean **0.319** (map **0.422** / obj 0.114). drivable 0.690, ped_crossing 0.341, walkway 0.401, divider 0.256, vehicle 0.203, pedestrian 0.025.
+- vs B: map +0.106 (ped_crossing 0.155 -> 0.341), objects -0.034. Val mIoU still rising slowly at epoch 60 (0.284 -> 0.285).
+- **Qualitative:** DiT draws coherent intersections, crossings and lane dividers that the sparse input barely shows (it attends to the images and has a layout prior); cars are crisp rectangles, but some are misplaced, so per-cell IoU punishes them (same effect as E4).
+- **Takeaway:** first diffusion model to beat the U-Net overall. The gain is in map layout, which needs image context + global attention; objects still favour B. Open question: how much comes from the cameras vs the transformer -> ablations use_cameras=False / use_sparse=False.
