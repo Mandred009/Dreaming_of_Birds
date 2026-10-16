@@ -116,9 +116,14 @@ def main():
         if os.path.exists(path):   # resumable
             continue
 
-        target = geo.boxes_to_bev(get_boxes_in_ego(nusc, sample), grid)
+        boxes = geo.boxes_to_bev(get_boxes_in_ego(nusc, sample), grid)
+        # Ego pose of LIDAR_TOP + map name: lets make_map_targets.py rasterise the map later without NuScenes.
+        lidar = nusc.get("sample_data", sample["data"]["LIDAR_TOP"])
+        pose = nusc.get("ego_pose", lidar["ego_pose_token"])
+        scene = nusc.get("scene", sample["scene_token"])
+        location = nusc.get("log", scene["log_token"])["location"]
 
-        sparse = np.zeros((4, grid["size"], grid["size"]), dtype=np.uint8)
+        sparse = np.zeros((geo.NUM_COARSE, grid["size"], grid["size"]), dtype=np.uint8)
         for cam in cfg["cameras"]:
             sd = nusc.get("sample_data", sample["data"][cam])
             image = Image.open(os.path.join(dataroot, sd["filename"])).convert("RGB")
@@ -136,7 +141,9 @@ def main():
             # Union over the 6 cameras (a cell is occupied if any camera saw it).
             sparse |= geo.points_to_sparse_bev(pts, labels, grid, pcfg["z_range"], pcfg["max_depth"])
 
-        np.savez_compressed(path, target=target, sparse=sparse, scene_name=scene_name)
+        np.savez_compressed(path, sparse=sparse, boxes=boxes, scene_name=scene_name, location=location,
+                            cam_files=np.array([nusc.get("sample_data", sample["data"][c])["filename"] for c in cfg["cameras"]]),
+                            ego_translation=np.array(pose["translation"]), ego_rotation=np.array(pose["rotation"]))
 
     with open(os.path.join(out_dir, "index.csv"), "w", newline="") as f:
         w = csv.writer(f)

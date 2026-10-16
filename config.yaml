@@ -5,7 +5,7 @@ dataset: trainval
 # Paths (mini)
 dataroot: ~/datasets/nuscenes
 version: v1.0-mini
-out_dir: ~/datasets/bev_cache      # outside the repo: cache is ~hundreds of MB
+out_dir: ~/datasets/bev_cache_v2   # v2 = 6-ch sparse + boxes + ego pose; outside the repo: cache is ~hundreds of MB
 
 # BEV grid, ego frame (x forward, y left). Row 0 = far forward, col 0 = far left.
 grid:
@@ -38,7 +38,7 @@ data:
 trainval:
   dataroot: ~/datasets/nuscenes_trainval
   version: v1.0-trainval
-  out_dir: ~/datasets/bev_cache_trainval
+  out_dir: ~/datasets/bev_cache_trainval_v2
   data:
     val_fraction: 0.08
     val_seed: 0

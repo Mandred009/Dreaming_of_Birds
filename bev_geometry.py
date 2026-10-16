@@ -10,29 +10,31 @@ CONVENTION (used everywhere in this project)
 import numpy as np
 import cv2
 
-# Cityscapes train id (0..18) -> coarse class, -1 = ignore (sky).
-# 0 flat: road, sidewalk, terrain   1 vehicle   2 person   3 other obstacle
+# Cityscapes train id (0..18) -> coarse class (sparse input v2, 6 channels), -1 = ignore (sky).
+# 0 road  1 sidewalk  2 terrain  3 vehicle  4 person  5 obstacle (building, wall, fence, pole, light, sign, vegetation)
+# (v1 had 4 channels with road/sidewalk/terrain merged into one "flat"; see git history.)
 CITYSCAPES_TO_COARSE = np.array([
     0,   # 0 road
-    0,   # 1 sidewalk
-    3,   # 2 building
-    3,   # 3 wall
-    3,   # 4 fence
-    3,   # 5 pole
-    3,   # 6 traffic light
-    3,   # 7 traffic sign
-    3,   # 8 vegetation
-    0,   # 9 terrain
+    1,   # 1 sidewalk
+    5,   # 2 building
+    5,   # 3 wall
+    5,   # 4 fence
+    5,   # 5 pole
+    5,   # 6 traffic light
+    5,   # 7 traffic sign
+    5,   # 8 vegetation
+    2,   # 9 terrain
     -1,  # 10 sky
-    2,   # 11 person
-    2,   # 12 rider
-    1,   # 13 car
-    1,   # 14 truck
-    1,   # 15 bus
-    1,   # 16 train
-    1,   # 17 motorcycle
-    1,   # 18 bicycle
+    4,   # 11 person
+    4,   # 12 rider
+    3,   # 13 car
+    3,   # 14 truck
+    3,   # 15 bus
+    3,   # 16 train
+    3,   # 17 motorcycle
+    3,   # 18 bicycle
 ], dtype=np.int64)
+NUM_COARSE = 6
 
 
 def metres_to_cells(x, y, grid):
@@ -44,18 +46,17 @@ def metres_to_cells(x, y, grid):
 
 
 def boxes_to_bev(boxes_in_ego, grid):
-    """Rasterise 3D boxes into a semantic BEV target.
+    """Rasterise 3D boxes into binary BEV masks (multi-label: vehicles and pedestrians may overlap).
 
     boxes_in_ego: list of dicts with keys
         center (x, y), size (width, length), yaw (rad, in ego frame),
         category (nuScenes name), num_pts (lidar + radar points inside).
-    Returns uint8 [size, size]: 0 background, 1 vehicle, 2 pedestrian.
+    Returns uint8 [2, size, size]: channel 0 vehicle, channel 1 pedestrian.
     """
     n = grid["size"]
-    bev = np.zeros((n, n), dtype=np.uint8)
+    bev = np.zeros((2, n, n), dtype=np.uint8)
 
-    # Pedestrians are small, so draw them last so a vehicle never hides them.
-    for label, prefix in [(1, "vehicle."), (2, "human.pedestrian.")]:
+    for ch, prefix in enumerate(["vehicle.", "human.pedestrian."]):
         for b in boxes_in_ego:
             if not b["category"].startswith(prefix):
                 continue
@@ -74,7 +75,7 @@ def boxes_to_bev(boxes_in_ego, grid):
             row, col = metres_to_cells(corners[:, 0], corners[:, 1], grid)
             # cv2 wants integer (x=col, y=row) points.
             poly = np.stack([col, row], axis=1).round().astype(np.int32)
-            cv2.fillPoly(bev, [poly], int(label))
+            cv2.fillPoly(bev[ch], [poly], 1)
     return bev
 
 
@@ -100,7 +101,7 @@ def depth_to_ego_points(depth_m, K, cam_to_ego, stride=4):
 
 
 def points_to_sparse_bev(points_ego, point_labels, grid, z_range=(-1.0, 3.0), max_depth=50.0,
-                         num_classes=4):
+                         num_classes=NUM_COARSE):
     """Drop points into BEV cells as binary occupancy per coarse class.
 
     points_ego: [N,3]; point_labels: [N] coarse class ids (-1 = ignore, e.g. sky).
