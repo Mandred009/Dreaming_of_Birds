@@ -60,12 +60,12 @@ unet:
 # Training
 train:
   seed: 0
-  epochs: 100
+  epochs: 40 
   batch_size: 16
   lr: 0.001
   weight_decay: 0.0001
   warmup_epochs: 5
-  patience: 25           # early stop if val mIoU has not improved for this many epochs
+  patience: 8            # early stop if val mIoU has not improved for this many epochs
   num_workers: 2
   augment_flip: true     # left-right mirror of sparse + target (B and D only)
   dice_weight: 1.0       # loss = pos_weighted BCE + dice_weight * soft Dice (per layer)
@@ -103,13 +103,13 @@ pixel_diffusion:
   ddim_steps: 20           # sampling steps (validation and inference)
   num_samples: 4           # samples per frame for the "mean" row (sigmoid probabilities averaged)
   seed: 0
-  epochs: 300
+  epochs: 80 
   batch_size: 16
   lr: 0.001
   weight_decay: 0.0001
   warmup_epochs: 5
-  val_every: 10            # epochs between validation runs (each is a full 20-step DDIM sampling)
-  patience: 8              # early stop after this many validations without val mIoU improvement
+  val_every: 5             # epochs between validation runs (each is a full 20-step DDIM sampling)
+  patience: 4              # early stop after this many validations without val mIoU improvement
   num_workers: 2
   ckpt_dir: checkpoints/v2/pixel_diffusion
   log_dir: runs/v2/pixel_diffusion
@@ -123,7 +123,7 @@ dit:
   patch: 8                 # 200 / 8 = 25 -> 25 x 25 = 625 BEV tokens
   use_sparse: true         # ablation: false = x_t only goes into the patch embedding
   use_cameras: true        # ablation: false = skip cross-attention (BEV-only DiT)
-  epochs: 100
+  epochs: 60 
   batch_size: 16
   grad_accum: 1
   lr: 0.0001
