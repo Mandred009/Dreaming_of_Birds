@@ -6,6 +6,7 @@ dataset: trainval
 dataroot: ~/datasets/nuscenes
 version: v1.0-mini
 out_dir: ~/datasets/bev_cache_v2   # v2 = 6-ch sparse + boxes + ego pose; outside the repo: cache is ~hundreds of MB
+img_feat_dir: ~/datasets/bev_feat_v2   # frozen DINOv2 camera tokens (extract_image_features.py), one <token>_img.npz per frame
 
 # BEV grid, ego frame (x forward, y left). Row 0 = far forward, col 0 = far left.
 grid:
@@ -39,14 +40,21 @@ trainval:
   dataroot: ~/datasets/nuscenes_trainval
   version: v1.0-trainval
   out_dir: ~/datasets/bev_cache_trainval_v2
+  img_feat_dir: ~/datasets/bev_feat_trainval_v2
   data:
     val_fraction: 0.08
     val_seed: 0
 
-# U-Net baseline
+# Frozen image encoder for the hybrid DiT (extract_image_features.py)
+img_features:
+  model: facebook/dinov2-small
+  image_hw: [224, 392]   # multiples of the ViT patch size 14 -> 16 x 28 patch tokens
+  pool: 2                # 2x2 average pool -> 8 x 14 = 112 tokens per camera, 672 per frame
+
+# U-Net baseline (v2: 6 sparse channels in, 6 independent (multi-label) map/object layers out)
 unet:
-  in_channels: 4
-  num_classes: 3
+  in_channels: 6
+  num_classes: 6
   channels: [32, 64, 128, 256]   # width at each of the 4 levels
 
 # Training
@@ -59,16 +67,17 @@ train:
   warmup_epochs: 5
   patience: 25           # early stop if val mIoU has not improved for this many epochs
   num_workers: 2
-  dice_weight: 1.0       # loss = weighted CE + dice_weight * soft Dice (foreground classes)
-  ckpt_dir: checkpoints/unet
-  log_dir: runs/unet
+  augment_flip: true     # left-right mirror of sparse + target (B and D only)
+  dice_weight: 1.0       # loss = pos_weighted BCE + dice_weight * soft Dice (per layer)
+  ckpt_dir: checkpoints/v2/unet     # v2 outputs live under v2/ so the v1 checkpoints stay untouched
+  log_dir: runs/v2/unet
 
 # Evaluation
 eval:
-  results_dir: results
+  results_dir: results/v2   # v1 results (results/*.md, *.png) are history, untouched
   num_qualitative: 4
 
-# Diffusion (model C): Stable Diffusion 1.5 + ControlNet. Only the ControlNet is trained.
+# Diffusion (model C, v1 only: not ported to the 6-layer v2 data): Stable Diffusion 1.5 + ControlNet. Only the ControlNet is trained.
 diffusion:
   base_model: runwayml/stable-diffusion-v1-5
   prompt: "a bird's-eye-view semantic map"   # fixed, so no classifier-free guidance
@@ -86,13 +95,13 @@ diffusion:
   ckpt_dir: checkpoints/diffusion
   log_dir: runs/diffusion
 
-# Pixel-space conditional diffusion (model D, E4): same U-Net backbone as B, trained from scratch.
-# Input = concat(noisy class map [3ch], sparse BEV [4ch]); backbone widths come from `unet.channels`.
+# Pixel-space conditional diffusion (model D): same U-Net backbone as B, trained from scratch.
+# Input = concat(noisy layers [6ch], sparse BEV [6ch]); backbone widths come from `unet.channels`.
 pixel_diffusion:
   T: 1000                  # number of training noise levels
   time_dim: 128            # size of the timestep embedding
   ddim_steps: 20           # sampling steps (validation and inference)
-  num_samples: 4           # samples per frame for the "mean" row (softmax probabilities averaged)
+  num_samples: 4           # samples per frame for the "mean" row (sigmoid probabilities averaged)
   seed: 0
   epochs: 300
   batch_size: 16
@@ -102,10 +111,27 @@ pixel_diffusion:
   val_every: 10            # epochs between validation runs (each is a full 20-step DDIM sampling)
   patience: 8              # early stop after this many validations without val mIoU improvement
   num_workers: 2
-  ckpt_dir: checkpoints/pixel_diffusion
-  log_dir: runs/pixel_diffusion
-  # E5 (refiner): also feed B's softmax probabilities (3 more input channels). Off for E4. Enabled by
-  # `train_pixel_diffusion.py --refiner`, which also switches to the two dirs below (E4 files untouched).
-  condition_on_unet: false
-  refiner_ckpt_dir: checkpoints/pixel_diffusion_refiner
-  refiner_log_dir: runs/pixel_diffusion_refiner
+  ckpt_dir: checkpoints/v2/pixel_diffusion
+  log_dir: runs/v2/pixel_diffusion
+
+# Hybrid DiT (model F): diffusion transformer over 8x8 BEV patches, cross-attending to frozen DINOv2 camera tokens.
+# Uses the same T / cosine schedule / DDIM / loss as `pixel_diffusion` (read from there), only the network differs.
+dit:
+  hidden: 384              # DiT-S
+  depth: 12
+  heads: 6
+  patch: 8                 # 200 / 8 = 25 -> 25 x 25 = 625 BEV tokens
+  use_sparse: true         # ablation: false = x_t only goes into the patch embedding
+  use_cameras: true        # ablation: false = skip cross-attention (BEV-only DiT)
+  epochs: 100
+  batch_size: 16
+  grad_accum: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  warmup_steps: 1000
+  ema_decay: 0.999
+  val_every: 5
+  num_workers: 2
+  seed: 0
+  ckpt_dir: checkpoints/dit
+  log_dir: runs/dit

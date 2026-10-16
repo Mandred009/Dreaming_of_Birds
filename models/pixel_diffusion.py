@@ -1,8 +1,8 @@
 """Pixel-space conditional diffusion (E4), written out by hand (no diffusers).
 
-Palette / SR3 style: the clean sample x0 is the class map (one-hot scaled to [-1, 1]); the
+Palette / SR3 style: the clean sample x0 is the 6 binary BEV layers scaled to [-1, 1]; the
 denoiser sees concat(x_t, sparse BEV) so the condition enters at the very first conv.
-The denoiser predicts x0 (as class logits) rather than the noise, see `loss_fn`.
+The denoiser predicts x0 (as per-layer logits, 6 independent binary layers), see `denoise_loss`.
 """
 import math
 import torch
@@ -32,54 +32,52 @@ def q_sample(x0, t, noise, alpha_bar):
     return ab.sqrt() * x0 + (1 - ab).sqrt() * noise
 
 
-def make_x0(target, num_classes=3):
-    """target [B,H,W] int -> x0 [B,3,H,W] in {-1,+1}."""
-    return to_signed(F.one_hot(target, num_classes).permute(0, 3, 1, 2).float())
+def make_x0(target):
+    """target [B,6,H,W] {0,1} -> x0 in {-1,+1} (the 6 layers are already multi-hot, no one-hot needed)."""
+    return to_signed(target)
 
 
-def denoise_loss(model, sparse, target, alpha_bar, loss_fn):
-    """One training step's loss: pick a random noise level per sample, noise the clean map,
-    ask the network for x0 and score it with the SAME weighted CE + Dice as baseline B.
-    Why predict x0 as logits (not eps): the data are discrete classes, so a classification loss
-    on the predicted x0 is the natural fit (x0-prediction with CE is what discrete/segmentation
-    diffusion models do), and it keeps the class-imbalance handling (weights, Dice) identical
-    to B, so B vs D differs only by the noisy input and the timestep."""
+def denoise_loss(model, sparse, target, alpha_bar, loss_fn, cams=None):
+    """One training step's loss: pick a random noise level per sample, noise the clean layers,
+    ask the network for x0 logits and score them with the SAME pos_weighted BCE + Dice as baseline B.
+    Why predict x0 as logits (not eps): the data are binary masks, so a classification loss on the
+    predicted x0 is the natural fit, and it keeps the class-imbalance handling identical to B, so
+    B vs D differs only by the noisy input and the timestep.
+    `model(x_t, sparse, t, cams)` is the common denoiser interface (U-Net and DiT)."""
     B = len(target)
     t = torch.randint(0, len(alpha_bar), (B,), device=target.device)
-    x_t = q_sample(make_x0(target), t, torch.randn(B, 3, *target.shape[1:], device=target.device), alpha_bar)
-    logits = model(torch.cat([x_t, sparse], dim=1), t)
-    return loss_fn(logits, target)
+    x_t = q_sample(make_x0(target), t, torch.randn_like(target), alpha_bar)
+    return loss_fn(model(x_t, sparse, t, cams).float(), target)
 
 
 @torch.no_grad()
-def predict_x0_once(model, sparse, target, t_value, alpha_bar):
-    """Probe: noise the true map to level t_value, return the argmax of the one-step x0 prediction."""
+def predict_x0_once(model, sparse, target, t_value, alpha_bar, cams=None):
+    """Probe: noise the true layers to level t_value, return the one-step x0 prediction (bool)."""
     t = torch.full((len(target),), t_value, device=target.device)
-    x_t = q_sample(make_x0(target), t, torch.randn(len(target), 3, *target.shape[1:], device=target.device), alpha_bar)
-    return model(torch.cat([x_t, sparse], dim=1), t).argmax(1)
+    x_t = q_sample(make_x0(target), t, torch.randn_like(target), alpha_bar)
+    return model(x_t, sparse, t, cams) > 0
 
 
 @torch.no_grad()
-def ddim_sample(model, sparse, alpha_bar, steps=20, generator=None):
-    """Deterministic DDIM (eta=0) from pure noise. Returns class probabilities [B,3,H,W].
+def ddim_sample(model, sparse, alpha_bar, steps=20, generator=None, cams=None):
+    """Deterministic DDIM (eta=0) from pure noise. Returns layer probabilities [B,6,H,W].
 
     At each step: the net gives x0_hat; from x0_hat and x_t we infer the noise
         eps_hat = (x_t - sqrt(ab_t) * x0_hat) / sqrt(1 - ab_t)
     and then re-noise x0_hat to the next (lower) level with that SAME eps_hat:
         x_prev = sqrt(ab_prev) * x0_hat + sqrt(1 - ab_prev) * eps_hat.
     Start: the cosine schedule has ab_{T-1} ~ 0, so x_T is (almost) exactly N(0,1) and we can
-    start from pure Gaussian noise. (E3's SD schedule kept ~7% of the signal at t=T, so there
-    pure-noise starts were out-of-distribution; that problem does not exist here.)"""
+    start from pure Gaussian noise."""
     T = len(alpha_bar)
     B, _, H, W = sparse.shape
-    x = torch.randn(B, 3, H, W, device=sparse.device, generator=generator)
+    x = torch.randn(B, 6, H, W, device=sparse.device, generator=generator)
     ts = torch.linspace(T - 1, 0, steps).round().long().tolist()      # e.g. 999, 946, ..., 0
     for i, t in enumerate(ts):
         t_batch = torch.full((B,), t, device=sparse.device)
-        probs = F.softmax(model(torch.cat([x, sparse], dim=1), t_batch), dim=1)
+        probs = torch.sigmoid(model(x, sparse, t_batch, cams).float())
         if i == len(ts) - 1:
             break                                                      # last step: keep x0_hat only
-        x0_hat = to_signed(probs)                                      # = 2*softmax - 1, in [-1, 1]
+        x0_hat = to_signed(probs)                                      # = 2*sigmoid - 1, in [-1, 1]
         ab_t, ab_prev = alpha_bar[t], alpha_bar[ts[i + 1]]
         eps_hat = (x - ab_t.sqrt() * x0_hat) / (1 - ab_t).sqrt()
         x = ab_prev.sqrt() * x0_hat + (1 - ab_prev).sqrt() * eps_hat
@@ -87,28 +85,8 @@ def ddim_sample(model, sparse, alpha_bar, steps=20, generator=None):
 
 
 @torch.no_grad()
-def predict(model, sparse, alpha_bar, steps=20, num_samples=1, generator=None):
-    """Class map [B,H,W]. num_samples > 1: average the softmax probabilities of the samples and
-    take the argmax. NOT a hard majority vote: E3 showed that when samples place objects
-    differently, a hard vote erases them, while averaged probabilities keep the likely ones."""
-    probs = sum(ddim_sample(model, sparse, alpha_bar, steps, generator) for _ in range(num_samples)) / num_samples
-    return probs.argmax(1)
-
-
-@torch.no_grad()
-def add_unet_probs(cfg, sparse, device="cuda", bs=16):
-    """E5 condition: sparse uint8 [N,4,H,W] numpy -> float32 [N,7,H,W] = concat(sparse, softmax of the
-    frozen baseline-B U-Net). The denoiser code above is unchanged: it just receives these 7 channels
-    wherever E4 passed the 4-channel `sparse`. Computed once per dataset and kept in memory.
-    Caveat: B was trained on the train frames, so its probabilities there are better than on val/test
-    (train/test mismatch for stacked models); the refiner learns to trust them more than it should."""
-    import os
-    from models.unet import build_unet
-    unet = build_unet(cfg).to(device)
-    unet.load_state_dict(torch.load(os.path.join(cfg["train"]["ckpt_dir"], "best.pt"), map_location=device))
-    unet.eval()
-    out = []
-    for i in range(0, len(sparse), bs):
-        x = torch.from_numpy(sparse[i:i + bs]).float().to(device)
-        out.append(torch.cat([x, F.softmax(unet(x), dim=1)], dim=1).cpu())
-    return torch.cat(out).numpy()
+def predict_probs(model, sparse, alpha_bar, steps=20, num_samples=1, generator=None, cams=None):
+    """Layer probabilities [B,6,H,W]; num_samples > 1 averages the sigmoid probabilities of the
+    samples (NOT a hard vote: in E3 a hard vote erased objects the samples placed differently,
+    averaged probabilities keep the likely ones). Threshold at 0.5 for masks."""
+    return sum(ddim_sample(model, sparse, alpha_bar, steps, generator, cams) for _ in range(num_samples)) / num_samples

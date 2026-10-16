@@ -1,216 +1,122 @@
-"""Evaluate baselines on the test split (= mini_val).  Usage: python evaluate.py --config config.yaml
+"""Evaluate on the test split (v2: 6 BEV layers).  Usage: python evaluate.py --config config.yaml
 
-Every method is a function  sparse [4,H,W] uint8 numpy -> prediction [H,W] int in {0,1,2}.
-To add a method later (e.g. diffusion), write such a function and add it to METHODS.
+Rows: A projection, B U-Net, D pixel diffusion (1 and 4 samples), F hybrid DiT (1 and 4 samples).
+Every method is a function  (sparse [B,6,H,W] float cuda, cams or None) -> probabilities [B,6,H,W];
+metrics.evaluate_model thresholds at 0.5 and accumulates per-layer TP/FP/FN.
+
+Model C (SD1.5 + ControlNet) and E (diffusion refiner on B) were 3-class v1 experiments. They are not
+ported to the 6-layer data and are not evaluated here; their code stays in git history and their
+results in EXPERIMENTS.md and results/*.md (v1).
 """
 import argparse
 import os
-import cv2
 import numpy as np
 import torch
 import yaml
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
 
 from dataset import BEVDataset
-from metrics import confusion_matrix, summarize
-from models.unet import build_unet
-from viz import sparse_to_rgb, label_to_rgb
+from metrics import LAYER_NAMES, evaluate_model
+from models.dit import build_dit
+from models.pixel_diffusion import cosine_alpha_bar, predict_probs
+from models.unet import build_denoiser, build_unet
+from viz import sparse_to_rgb, target_to_rgb
 
 
-def projection_only(sparse):
-    """Baseline A: trust the projected camera labels. Pedestrian drawn over vehicle."""
-    pred = np.zeros(sparse.shape[1:], dtype=np.uint8)
-    pred[sparse[1] == 1] = 1
-    pred[sparse[2] == 1] = 2
-    return pred
+def projection_only(sparse, cams=None):
+    """Baseline A: trust the projected camera labels. sparse channels: 0 road, 1 sidewalk, 2 terrain,
+    3 vehicle, 4 person, 5 obstacle. Target layers: 0 drivable<-road, 1 crossing<-empty,
+    2 walkway<-sidewalk, 3 divider<-empty, 4 vehicle<-vehicle, 5 pedestrian<-person."""
+    zeros = torch.zeros_like(sparse[:, 0])
+    return torch.stack([sparse[:, 0], zeros, sparse[:, 1], zeros, sparse[:, 3], sparse[:, 4]], dim=1)
 
 
-def projection_dilated(sparse):
-    """Baseline A+: same, but each projected point is grown with a 3x3 dilation so the sparse
-    dots cover a bit more of the object footprint."""
-    kernel = np.ones((3, 3), np.uint8)
-    grown = np.stack([cv2.dilate(sparse[c], kernel) for c in range(sparse.shape[0])])
-    return projection_only(grown)
-
-
-def make_unet_method(cfg, device="cuda"):
-    model = build_unet(cfg).to(device)
-    model.load_state_dict(torch.load(os.path.join(cfg["train"]["ckpt_dir"], "best.pt"), map_location=device))
-    model.eval()
-
-    @torch.no_grad()
-    def predict(sparse):
-        x = torch.from_numpy(sparse).float()[None].to(device)
-        return model(x).argmax(1)[0].cpu().numpy()
-    return predict
-
-
-def load_diffusion(cfg):
-    """Model C: SD 1.5 + the trained ControlNet (checkpoints/diffusion/best).
-    Returns None if there is no checkpoint yet."""
-    path = os.path.join(cfg["diffusion"]["ckpt_dir"], "best")
-    if not os.path.isdir(path):
-        return None
-    from diffusers import ControlNetModel
-    from models.diffusion import BEVDiffusion, encode_prompt
-    model = BEVDiffusion(cfg, encode_prompt(cfg))
-    model.controlnet = ControlNetModel.from_pretrained(path).to("cuda")   # swap in trained weights
-    return model.eval()
-
-
-def run_diffusion(model, sparse_all, num_samples, bs=4):
-    """Predict all frames in small batches (each frame needs num_samples x 25 UNet passes)."""
-    return np.concatenate([model.predict(torch.from_numpy(sparse_all[i:i + bs]), num_samples, seed=i).cpu().numpy()
-                           for i in range(0, len(sparse_all), bs)])
-
-
-def load_pixel_diffusion(cfg, device="cuda", refiner=False):
-    """Model D (E4) or, with refiner=True, model E (E5): the trained pixel-space denoiser.
-    None if there is no checkpoint yet."""
-    p = cfg["pixel_diffusion"]
-    path = os.path.join(p["refiner_ckpt_dir" if refiner else "ckpt_dir"], "best.pt")
+def load_unet(cfg, device):
+    path = os.path.join(cfg["train"]["ckpt_dir"], "best.pt")
     if not os.path.exists(path):
         return None
-    if refiner:
-        import copy
-        cfg = copy.deepcopy(cfg)
-        cfg["pixel_diffusion"]["condition_on_unet"] = True   # 10-channel input
-    from models.unet import build_denoiser
-    model = build_denoiser(cfg).to(device)
+    model = build_unet(cfg).to(device)
     model.load_state_dict(torch.load(path, map_location=device))
-    return model.eval()
+    model.eval()
+    return lambda sparse, cams: torch.sigmoid(model(sparse))
 
 
-def run_pixel_diffusion(model, cfg, sparse_all, num_samples, bs=16):
-    from models.pixel_diffusion import cosine_alpha_bar, predict
+def load_diffusion(cfg, kind, device, num_samples):
+    """kind 'D' (pixel U-Net denoiser) or 'F' (hybrid DiT). Returns a method function, or None if no checkpoint."""
     p = cfg["pixel_diffusion"]
-    alpha_bar = cosine_alpha_bar(p["T"]).cuda()
-    gen = torch.Generator(device="cuda").manual_seed(p["seed"])
-    return np.concatenate([predict(model, torch.from_numpy(sparse_all[i:i + bs]).float().cuda(), alpha_bar,
-                                   p["ddim_steps"], num_samples, gen).cpu().numpy()
-                           for i in range(0, len(sparse_all), bs)])
+    path = os.path.join(p["ckpt_dir"] if kind == "D" else cfg["dit"]["ckpt_dir"], "best.pt")
+    if not os.path.exists(path):
+        return None
+    model = (build_denoiser(cfg) if kind == "D" else build_dit(cfg)).to(device)
+    model.load_state_dict(torch.load(path, map_location=device))   # DiT best.pt holds the EMA weights
+    model.eval()
+    alpha_bar = cosine_alpha_bar(p["T"]).to(device)
+    gen = torch.Generator(device=device).manual_seed(p["seed"])
+
+    def fn(sparse, cams):
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(kind == "F")):
+            return predict_probs(model, sparse, alpha_bar, p["ddim_steps"], num_samples, gen, cams)
+    return fn
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     cfg = yaml.safe_load(open(ap.parse_args().config))
-    val = BEVDataset(cfg, "test", augment=False)
+    device = "cuda"
+    k_mean = cfg["pixel_diffusion"]["num_samples"]
+    use_cams = cfg["dit"]["use_cameras"] and os.path.exists(os.path.join(cfg["dit"]["ckpt_dir"], "best.pt"))
+    test = BEVDataset(cfg, "test", augment=False, with_cams=use_cams)
+    loader = DataLoader(test, 16, num_workers=0)
 
-    # (name, function). Hook: append e.g. ("Diffusion", make_diffusion_method(cfg)) here.
-    methods = [("A: projection only", projection_only),
-               ("A+: projection + 3x3 dilation", projection_dilated),
-               ("B: U-Net", make_unet_method(cfg))]
+    candidates = [("A: projection only", projection_only),
+                  ("B: U-Net", load_unet(cfg, device)),
+                  ("D: pixel diffusion (1 sample)", load_diffusion(cfg, "D", device, 1)),
+                  (f"D: pixel diffusion ({k_mean}-sample mean)", load_diffusion(cfg, "D", device, k_mean)),
+                  ("F: hybrid DiT (1 sample)", load_diffusion(cfg, "F", device, 1)),
+                  (f"F: hybrid DiT ({k_mean}-sample mean)", load_diffusion(cfg, "F", device, k_mean))]
+    k = cfg["eval"]["num_qualitative"]
+    ids = set(np.linspace(0, len(test) - 1, k).astype(int).tolist())
+    results, preds = {}, {}
+    for name, fn in candidates:
+        if fn is None:
+            print(f"skip {name}: no checkpoint")
+            continue
+        results[name], preds[name] = evaluate_model(fn, loader, device, ids)
+        print(name, {a: round(b, 3) for a, b in results[name].items()}, flush=True)
 
-    preds = {name: np.stack([fn(s) for s in val.sparse]) for name, fn in methods}
-
-    # Model C: loaded only if a checkpoint exists; 1 sample and k-sample vote; freed afterwards.
-    model = load_diffusion(cfg)
-    if model is not None:
-        k_vote = cfg["diffusion"]["vote_samples"]
-        for name, k in [("C: diffusion (1 sample)", 1), (f"C: diffusion ({k_vote}-sample vote)", k_vote)]:
-            preds[name] = run_diffusion(model, val.sparse, k)
-            methods.append((name, None))
-        del model
-        torch.cuda.empty_cache()
-
-    # Model D: pixel diffusion; 1 sample and k-sample mean of softmax probabilities.
-    model = load_pixel_diffusion(cfg)
-    if model is not None:
-        k_mean = cfg["pixel_diffusion"]["num_samples"]
-        for name, k in [("D: pixel diffusion (1 sample)", 1), (f"D: pixel diffusion ({k_mean}-sample mean)", k_mean)]:
-            preds[name] = run_pixel_diffusion(model, cfg, val.sparse, k)
-            methods.append((name, None))
-        del model
-        torch.cuda.empty_cache()
-
-    # Model E (E5): diffusion refiner conditioned on B's softmax. Its condition = sparse + B probs.
-    model = load_pixel_diffusion(cfg, refiner=True)
-    if model is not None:
-        from models.pixel_diffusion import add_unet_probs
-        cond = add_unet_probs(cfg, val.sparse)
-        k_mean = cfg["pixel_diffusion"]["num_samples"]
-        for name, k in [("E: diffusion refiner on U-Net (1 sample)", 1), (f"E: diffusion refiner on U-Net ({k_mean}-sample mean)", k_mean)]:
-            preds[name] = run_pixel_diffusion(model, cfg, cond, k)
-            methods.append((name, None))
-        del model
-        torch.cuda.empty_cache()
-
-    lines = ["| Method | Vehicle IoU | Pedestrian IoU | mIoU |", "|---|---|---|---|"]
-    for name, _ in methods:
-        m = summarize(confusion_matrix(preds[name], val.target, 3))
-        lines.append(f"| {name} | {m['vehicle']:.3f} | {m['pedestrian']:.3f} | {m['miou']:.3f} |")
+    cols = LAYER_NAMES + ["map_mIoU", "obj_mIoU", "mIoU"]
+    lines = ["| Method | " + " | ".join(cols) + " |", "|---" * (len(cols) + 1) + "|"]
+    for name, m in results.items():
+        lines.append(f"| {name} | " + " | ".join(f"{m[c]:.3f}" for c in cols) + " |")
     table = "\n".join(lines)
-    print(table)
-
     out_dir = cfg["eval"]["results_dir"]
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "results.md"), "w") as f:
-        f.write(f"mIoU = mean of vehicle and pedestrian IoU, on test = mini_val ({len(val)} samples)\n\n{table}\n")
+        f.write(f"Per-layer IoU at threshold 0.5 on test ({len(test)} frames); map_mIoU = layers 0-3, "
+                f"obj_mIoU = 4-5, mIoU = all 6.\n\n{table}\n")
+    print(table)
 
-    # Qualitative figure: evenly spaced test samples; columns = sparse | each method | target.
-    k = cfg["eval"]["num_qualitative"]
-    ids = np.linspace(0, len(val) - 1, k).astype(int)
-    names = [n for n, _ in methods if n in ("A: projection only", "B: U-Net")] or [methods[0][0]]
-    cols = ["sparse input"] + names + ["target"]
-    fig, axes = plt.subplots(k, len(cols), figsize=(4 * len(cols), 4 * k))
+    # Qualitative figure: sparse | B | D (1 sample) | DiT (1 sample) | target, for evenly spaced test frames.
+    shown = [n for n in ("B: U-Net", "D: pixel diffusion (1 sample)", "F: hybrid DiT (1 sample)") if n in preds]
+    if not shown:
+        return
+    ids = sorted(ids)
+    fig, axes = plt.subplots(len(ids), len(shown) + 2, figsize=(4 * (len(shown) + 2), 4 * len(ids)), squeeze=False)
     for r, i in enumerate(ids):
-        imgs = [sparse_to_rgb(val.sparse[i])] + [label_to_rgb(preds[n][i]) for n in names] + [label_to_rgb(val.target[i])]
-        for c, (img, title) in enumerate(zip(imgs, cols)):
+        sparse, target = test[i][0].numpy(), test[i][1].numpy()
+        imgs = [sparse_to_rgb(sparse)] + [target_to_rgb(preds[n][i]) for n in shown] + [target_to_rgb(target)]
+        for c, (img, title) in enumerate(zip(imgs, ["sparse input"] + shown + ["target"])):
             axes[r, c].imshow(img)
             axes[r, c].plot(100, 100, "w+")   # ego car
             axes[r, c].axis("off")
             if r == 0:
                 axes[r, c].set_title(title)
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "qualitative_unet.png"), dpi=70)
-
-    # Qualitative figure with diffusion: sparse | U-Net | diffusion | target.
-    if "C: diffusion (1 sample)" in preds:
-        cols = ["sparse input", "U-Net", "diffusion (1 sample)", "target"]
-        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
-        for r, i in enumerate(ids):
-            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
-                    label_to_rgb(preds["C: diffusion (1 sample)"][i]), label_to_rgb(val.target[i])]
-            for c, (img, title) in enumerate(zip(imgs, cols)):
-                axes[r, c].imshow(img)
-                axes[r, c].axis("off")
-                if r == 0:
-                    axes[r, c].set_title(title)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "qualitative_diffusion.png"), dpi=70)
-
-    # Qualitative figure with pixel diffusion: sparse | U-Net | pixel diffusion | target.
-    if "D: pixel diffusion (1 sample)" in preds:
-        cols = ["sparse input", "U-Net", "pixel diffusion (1 sample)", "target"]
-        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
-        for r, i in enumerate(ids):
-            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
-                    label_to_rgb(preds["D: pixel diffusion (1 sample)"][i]), label_to_rgb(val.target[i])]
-            for c, (img, title) in enumerate(zip(imgs, cols)):
-                axes[r, c].imshow(img)
-                axes[r, c].axis("off")
-                if r == 0:
-                    axes[r, c].set_title(title)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "qualitative_pixel_diffusion.png"), dpi=70)
-
-    # Qualitative figure with the refiner: sparse | U-Net | refiner | target.
-    if "E: diffusion refiner on U-Net (1 sample)" in preds:
-        cols = ["sparse input", "U-Net", "refiner (1 sample)", "target"]
-        fig, axes = plt.subplots(k, 4, figsize=(16, 4 * k))
-        for r, i in enumerate(ids):
-            imgs = [sparse_to_rgb(val.sparse[i]), label_to_rgb(preds["B: U-Net"][i]),
-                    label_to_rgb(preds["E: diffusion refiner on U-Net (1 sample)"][i]), label_to_rgb(val.target[i])]
-            for c, (img, title) in enumerate(zip(imgs, cols)):
-                axes[r, c].imshow(img)
-                axes[r, c].axis("off")
-                if r == 0:
-                    axes[r, c].set_title(title)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, "qualitative_refiner.png"), dpi=70)
+    plt.savefig(os.path.join(out_dir, "qualitative.png"), dpi=70)
 
 
 if __name__ == "__main__":

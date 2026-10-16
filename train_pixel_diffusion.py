@@ -1,112 +1,56 @@
-"""Train the pixel-space conditional diffusion model (E4), or with --refiner the E5 variant.
-Usage: python train_pixel_diffusion.py --config config.yaml [--epochs N] [--probe]
---probe: no training; load best.pt and print one-step x0 IoU at t=50 and t=999 on train/val/test."""
+"""Train the pixel-space conditional diffusion model D on the 6-layer v2 data.
+Usage: python train_pixel_diffusion.py --config config.yaml [--epochs N]
+(The v1 --refiner (E5) and --probe options were removed; see git history / EXPERIMENTS.md.)"""
 import argparse
 import os
 import time
-import numpy as np
 import torch
 import yaml
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import BEVDataset
-from metrics import confusion_matrix, summarize
-from models.pixel_diffusion import add_unet_probs, cosine_alpha_bar, denoise_loss, predict, predict_x0_once
+from metrics import evaluate_model, format_metrics
+from models.pixel_diffusion import cosine_alpha_bar, denoise_loss, predict_probs
 from models.unet import build_denoiser
-from train import class_weights, make_loss, seed_everything   # same loss as baseline B
+from train import layer_pos_weights, make_loss, seed_everything   # same loss as baseline B
 
 
-class CondDataset(Dataset):
-    """E5 training data: cond [N,7,H,W] float (sparse + B's probs) with the same left-right flip
-    augmentation as BEVDataset; the probabilities are flipped together with sparse and target."""
-    def __init__(self, cond, target, augment):
-        self.cond, self.target, self.augment = cond, target, augment
-
-    def __len__(self):
-        return len(self.cond)
-
-    def __getitem__(self, i):
-        c, y = self.cond[i], self.target[i]
-        if self.augment and np.random.rand() < 0.5:
-            c, y = c[:, :, ::-1], y[:, ::-1]
-        return torch.from_numpy(np.ascontiguousarray(c)).float(), torch.from_numpy(np.ascontiguousarray(y)).long()
-
-
-@torch.no_grad()
-def sample_miou(model, ds, alpha_bar, p, device, num_samples=1):
+def val_miou(model, ds, alpha_bar, p, device, num_samples=1, seed=123):
     """Full DDIM sampling over a dataset -> metrics. Fixed generator so successive validations
     use the same noise and differ only because the model changed."""
     model.eval()
-    gen = torch.Generator(device=device).manual_seed(123)
-    cm = np.zeros((3, 3), dtype=np.int64)
-    for i in range(0, len(ds), 16):
-        x = torch.from_numpy(ds.sparse[i:i + 16]).float().to(device)
-        pred = predict(model, x, alpha_bar, p["ddim_steps"], num_samples, gen)
-        cm += confusion_matrix(pred.cpu().numpy(), ds.target[i:i + 16], 3)
-    return summarize(cm)
-
-
-@torch.no_grad()
-def probe(model, ds, alpha_bar, t_value, device):
-    """IoU of the one-step x0 prediction from the true map noised to level t_value."""
-    model.eval()
-    torch.manual_seed(0)
-    cm = np.zeros((3, 3), dtype=np.int64)
-    for i in range(0, len(ds), 16):
-        x = torch.from_numpy(ds.sparse[i:i + 16]).float().to(device)
-        y = torch.from_numpy(ds.target[i:i + 16]).long().to(device)
-        cm += confusion_matrix(predict_x0_once(model, x, y, t_value, alpha_bar).cpu().numpy(), ds.target[i:i + 16], 3)
-    return summarize(cm)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    fn = lambda sparse, cams: predict_probs(model, sparse, alpha_bar, p["ddim_steps"], num_samples, gen, cams)
+    return evaluate_model(fn, DataLoader(ds, 16), device)[0]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--epochs", type=int, default=None, help="override config (smoke test)")
-    ap.add_argument("--probe", action="store_true")
-    ap.add_argument("--refiner", action="store_true", help="E5: also condition on B's softmax; separate ckpt/log dirs")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
     p, t = cfg["pixel_diffusion"], cfg["train"]
-    if args.refiner:
-        p["condition_on_unet"] = True
-        p["ckpt_dir"], p["log_dir"] = p["refiner_ckpt_dir"], p["refiner_log_dir"]
     epochs = args.epochs or p["epochs"]
     seed_everything(p["seed"])
     device = "cuda"
 
-    def load(split, augment):
-        ds = BEVDataset(cfg, split, augment=augment)
-        if args.refiner:
-            ds.sparse = add_unet_probs(cfg, ds.sparse)   # [N,7,H,W] float: sparse + B's softmax
-        return ds
-    train_ds = load("train", True)
-    val_ds = load("val", False)
+    train_ds = BEVDataset(cfg, "train", augment=True)   # flip on if train.augment_flip
+    val_ds = BEVDataset(cfg, "val", augment=False)
     alpha_bar = cosine_alpha_bar(p["T"]).to(device)
     model = build_denoiser(cfg).to(device)
-
-    if args.probe:
-        model.load_state_dict(torch.load(os.path.join(p["ckpt_dir"], "best.pt"), map_location=device))
-        for name in ["train", "val", "test"]:
-            ds = load(name, False)
-            for tv in (50, 999):
-                m = probe(model, ds, alpha_bar, tv, device)
-                print(f"{name:5s} t={tv:3d}: veh {m['vehicle']:.3f} ped {m['pedestrian']:.3f} mIoU {m['miou']:.3f}")
-        return
-
-    if args.refiner:
-        train_ds = CondDataset(train_ds.sparse, train_ds.target, augment=True)
     train_dl = DataLoader(train_ds, p["batch_size"], shuffle=True, num_workers=p["num_workers"], drop_last=True)
     print(f"train {len(train_ds)} samples, val {len(val_ds)} samples")
 
-    # Class weights and loss: exactly as in train.py (baseline B).
-    weights, _ = class_weights(train_ds.target, cfg["unet"]["num_classes"])
-    loss_fn = make_loss(weights.to(device), t["dice_weight"])
+    # Class-imbalance handling: exactly as in train.py (baseline B).
+    pos_weight = layer_pos_weights(train_ds.layer_freq)
+    print("layer freq", train_ds.layer_freq.round(5), "-> BCE pos_weight", pos_weight.numpy().round(2))
+    loss_fn = make_loss(pos_weight.to(device), t["dice_weight"])
 
     opt = torch.optim.AdamW(model.parameters(), lr=p["lr"], weight_decay=p["weight_decay"])
     warm = torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=p["warmup_epochs"])
-    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs - p["warmup_epochs"])
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs - p["warmup_epochs"]))
     sched = torch.optim.lr_scheduler.SequentialLR(opt, [warm, cosine], milestones=[p["warmup_epochs"]])
 
     os.makedirs(p["ckpt_dir"], exist_ok=True)
@@ -130,13 +74,13 @@ def main():
         torch.save(model.state_dict(), os.path.join(p["ckpt_dir"], "last.pt"))
 
         if epoch % p["val_every"] == 0 or epoch == epochs:
-            m = sample_miou(model, val_ds, alpha_bar, p, device)
+            m = val_miou(model, val_ds, alpha_bar, p, device)
             mem = torch.cuda.max_memory_allocated() / 2**20
-            print(f"ep {epoch:3d} | train loss {train_loss:.4f} | val (DDIM {p['ddim_steps']}) IoU veh {m['vehicle']:.3f} "
-                  f"ped {m['pedestrian']:.3f} mIoU {m['miou']:.3f} | {mem:.0f} MiB | {(time.time() - start) / 60:.1f} min", flush=True)
-            writer.add_scalars("val_iou", {"vehicle": m["vehicle"], "pedestrian": m["pedestrian"], "miou": m["miou"]}, epoch)
-            if m["miou"] > best:
-                best, bad_vals = m["miou"], 0
+            print(f"ep {epoch:3d} | train loss {train_loss:.4f} | val (DDIM {p['ddim_steps']}) {format_metrics(m)} | "
+                  f"{mem:.0f} MiB | {(time.time() - start) / 60:.1f} min", flush=True)
+            writer.add_scalars("val_iou", m, epoch)
+            if m["mIoU"] > best:
+                best, bad_vals = m["mIoU"], 0
                 torch.save(model.state_dict(), os.path.join(p["ckpt_dir"], "best.pt"))
             else:
                 bad_vals += 1

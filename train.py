@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from dataset import BEVDataset
-from metrics import confusion_matrix, summarize
+from metrics import accumulate, format_metrics, new_stats, summarize
 from models.unet import build_unet
 
 
@@ -22,47 +22,44 @@ def seed_everything(seed):
     torch.cuda.manual_seed_all(seed)
 
 
-def class_weights(target, num_classes):
-    """Inverse-sqrt-frequency weights, normalised to mean 1. Plain inverse frequency would give
-    pedestrians (0.12% of pixels) a ~800x weight and make training unstable; sqrt softens it."""
-    freq = np.bincount(target.reshape(-1), minlength=num_classes) / target.size
-    w = 1.0 / np.sqrt(freq)
-    return torch.tensor(w / w.mean(), dtype=torch.float32), freq
+def layer_pos_weights(freq):
+    """BCE pos_weight per layer = sqrt(neg / pos). Full neg/pos would give pedestrians (~0.1% of cells)
+    a ~1000x weight and make training unstable; the sqrt softens it (same idea as the v1 class weights)."""
+    freq = np.clip(freq, 1e-6, 1 - 1e-6)
+    return torch.tensor(np.sqrt((1 - freq) / freq), dtype=torch.float32)
 
 
 def soft_dice_loss(logits, target, eps=1.0):
-    """1 - Dice on the foreground classes (1, 2), computed on softmax probabilities so it is
-    differentiable. Averaged over classes, summed over the whole batch for stability."""
-    probs = F.softmax(logits, dim=1)
-    onehot = F.one_hot(target, probs.shape[1]).permute(0, 3, 1, 2).float()
-    probs, onehot = probs[:, 1:], onehot[:, 1:]
-    inter = (probs * onehot).sum(dim=(0, 2, 3))
-    total = probs.sum(dim=(0, 2, 3)) + onehot.sum(dim=(0, 2, 3))
+    """1 - Dice, per layer, on sigmoid probabilities (differentiable), averaged over the 6 layers.
+    Sums run over the whole batch so a frame where a layer is empty does not give a 0/0 term."""
+    probs = torch.sigmoid(logits)
+    inter = (probs * target).sum(dim=(0, 2, 3))
+    total = probs.sum(dim=(0, 2, 3)) + target.sum(dim=(0, 2, 3))
     return 1 - ((2 * inter + eps) / (total + eps)).mean()
 
 
-def make_loss(weights, dice_weight):
-    """Loss = weighted CE + dice_weight * soft Dice.
-    CE with class weights gives dense, well-behaved gradients on every pixel; Dice directly
-    optimises overlap (what IoU measures) and is insensitive to the huge background count.
-    Together they are the standard, simple recipe for rare foreground classes."""
+def make_loss(pos_weight, dice_weight):
+    """Loss = pos_weighted BCE-with-logits + dice_weight * soft Dice.
+    The 6 layers are independent binary problems (a cell can be in several), so sigmoid/BCE per layer
+    replaces the softmax/CE of v1. BCE gives dense gradients on every cell; Dice optimises overlap
+    (what IoU measures) and ignores the huge background count."""
     def loss_fn(logits, target):
-        ce = F.cross_entropy(logits, target, weight=weights)
-        return ce + dice_weight * soft_dice_loss(logits, target)
+        bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight[None, :, None, None])
+        return bce + dice_weight * soft_dice_loss(logits, target)
     return loss_fn
 
 
 @torch.no_grad()
-def validate(model, loader, loss_fn, device, n_classes=3):
+def validate(model, loader, loss_fn, device):
     model.eval()
-    cm, total_loss, n = np.zeros((n_classes, n_classes), dtype=np.int64), 0.0, 0
+    stats, total_loss, n = new_stats(), 0.0, 0
     for x, y in loader:
         x, y = x.to(device), y.to(device)
         logits = model(x)
         total_loss += loss_fn(logits, y).item() * len(x)
         n += len(x)
-        cm += confusion_matrix(logits.argmax(1).cpu().numpy(), y.cpu().numpy(), n_classes)
-    return total_loss / n, summarize(cm)
+        accumulate(stats, logits > 0, y)   # logit > 0 <=> sigmoid > 0.5
+    return total_loss / n, summarize(stats)
 
 
 def main():
@@ -79,9 +76,9 @@ def main():
     val_dl = DataLoader(val_ds, t["batch_size"], shuffle=False, num_workers=t["num_workers"])
     print(f"train {len(train_ds)} samples, val {len(val_ds)} samples (config dataset: {cfg.get('dataset', 'mini')}; test is not used here)")
 
-    weights, freq = class_weights(train_ds.target, cfg["unet"]["num_classes"])
-    print("class freq", freq.round(5), "-> CE weights", weights.numpy().round(3))
-    loss_fn = make_loss(weights.to(device), t["dice_weight"])
+    pos_weight = layer_pos_weights(train_ds.layer_freq)
+    print("layer freq", train_ds.layer_freq.round(5), "-> BCE pos_weight", pos_weight.numpy().round(2))
+    loss_fn = make_loss(pos_weight.to(device), t["dice_weight"])
 
     model = build_unet(cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=t["lr"], weight_decay=t["weight_decay"])
@@ -110,17 +107,16 @@ def main():
         val_loss, m = validate(model, val_dl, loss_fn, device)
         lr = opt.param_groups[0]["lr"]
         mem = torch.cuda.max_memory_allocated() / 2**20
-        print(f"ep {epoch:3d} | train {train_loss:.4f} val {val_loss:.4f} | IoU veh {m['vehicle']:.3f} "
-              f"ped {m['pedestrian']:.3f} mIoU {m['miou']:.3f} bg {m['background']:.3f} | lr {lr:.2e} | {mem:.0f} MiB",
+        print(f"ep {epoch:3d} | train {train_loss:.4f} val {val_loss:.4f} | {format_metrics(m)} | lr {lr:.2e} | {mem:.0f} MiB",
               flush=True)
         writer.add_scalars("loss", {"train": train_loss, "val": val_loss}, epoch)
-        writer.add_scalars("val_iou", {"vehicle": m["vehicle"], "pedestrian": m["pedestrian"], "miou": m["miou"]}, epoch)
+        writer.add_scalars("val_iou", {k: v for k, v in m.items()}, epoch)
         writer.add_scalar("lr", lr, epoch)
         writer.add_scalar("gpu_mem_MiB", mem, epoch)
 
         torch.save(model.state_dict(), os.path.join(t["ckpt_dir"], "last.pt"))
-        if m["miou"] > best:
-            best, bad_epochs = m["miou"], 0
+        if m["mIoU"] > best:
+            best, bad_epochs = m["mIoU"], 0
             torch.save(model.state_dict(), os.path.join(t["ckpt_dir"], "best.pt"))
         else:
             bad_epochs += 1

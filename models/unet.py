@@ -83,11 +83,18 @@ def build_unet(cfg):
     return model
 
 
+class UNetDenoiser(UNet):
+    """Diffusion wrapper with the interface shared with the DiT: forward(x_t, sparse, t, cams=None).
+    The condition (sparse BEV) is concatenated to the noisy map at the first conv. `cams` is ignored
+    (the U-Net has no camera input)."""
+    def forward(self, x_t, sparse, t, cams=None):
+        return super().forward(torch.cat([x_t, sparse], dim=1), t)
+
+
 def build_denoiser(cfg):
-    """E4 denoiser: the SAME backbone widths as B, but 7 input channels (3 noisy-map + 4 sparse)
-    and a timestep embedding. Output: 3 channels = class logits for the clean map."""
-    p = cfg["pixel_diffusion"]
-    extra = cfg["unet"]["num_classes"] if p.get("condition_on_unet") else 0   # E5: + B's softmax probs
-    model = UNet(3 + cfg["unet"]["in_channels"] + extra, cfg["unet"]["num_classes"], cfg["unet"]["channels"], time_dim=p["time_dim"])
+    """Model D denoiser: the SAME backbone widths as B, but 12 input channels (6 noisy layers +
+    6 sparse) and a timestep embedding. Output: 6 channels = logits of the clean layers."""
+    p, u = cfg["pixel_diffusion"], cfg["unet"]
+    model = UNetDenoiser(u["num_classes"] + u["in_channels"], u["num_classes"], u["channels"], time_dim=p["time_dim"])
     print(f"Denoiser parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
     return model
