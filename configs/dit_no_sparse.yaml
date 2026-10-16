@@ -1,0 +1,121 @@
+# DiT ablation (no_sparse): generated from config.yaml, only dit flags/dirs and results_dir differ.
+dataset: trainval
+dataroot: ~/datasets/nuscenes
+version: v1.0-mini
+out_dir: ~/datasets/bev_cache_v2
+img_feat_dir: ~/datasets/bev_feat_v2
+grid:
+  size: 200
+  resolution: 0.5
+  x_range:
+  - -50.0
+  - 50.0
+  y_range:
+  - -50.0
+  - 50.0
+points:
+  stride: 4
+  max_depth: 50.0
+  z_range:
+  - -1.0
+  - 3.0
+depth_model: depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf
+seg_model: nvidia/segformer-b2-finetuned-cityscapes-1024-1024
+cameras:
+- CAM_FRONT
+- CAM_FRONT_LEFT
+- CAM_FRONT_RIGHT
+- CAM_BACK
+- CAM_BACK_LEFT
+- CAM_BACK_RIGHT
+data:
+  val_scene: scene-0655
+trainval:
+  dataroot: ~/datasets/nuscenes_trainval
+  version: v1.0-trainval
+  out_dir: ~/datasets/bev_cache_trainval_v2
+  img_feat_dir: ~/datasets/bev_feat_trainval_v2
+  data:
+    val_fraction: 0.08
+    val_seed: 0
+img_features:
+  model: facebook/dinov2-small
+  image_hw:
+  - 224
+  - 392
+  pool: 2
+unet:
+  in_channels: 6
+  num_classes: 6
+  channels:
+  - 32
+  - 64
+  - 128
+  - 256
+train:
+  seed: 0
+  epochs: 40
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  patience: 8
+  num_workers: 2
+  augment_flip: true
+  dice_weight: 1.0
+  ckpt_dir: checkpoints/v2/unet
+  log_dir: runs/v2/unet
+eval:
+  results_dir: results/v2/ablation_no_sparse
+  num_qualitative: 4
+diffusion:
+  base_model: runwayml/stable-diffusion-v1-5
+  prompt: a bird's-eye-view semantic map
+  image_size: 256
+  seed: 0
+  lr: 0.0001
+  batch_size: 8
+  grad_accum: 1
+  shift_prob: 0.5
+  point_keep_min: 0.5
+  max_steps: 14000
+  eval_every: 1000
+  ddim_steps: 25
+  vote_samples: 4
+  ckpt_dir: checkpoints/diffusion
+  log_dir: runs/diffusion
+pixel_diffusion:
+  T: 1000
+  time_dim: 128
+  ddim_steps: 20
+  num_samples: 4
+  seed: 0
+  epochs: 80
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  val_every: 5
+  patience: 4
+  num_workers: 2
+  ckpt_dir: checkpoints/v2/pixel_diffusion
+  log_dir: runs/v2/pixel_diffusion
+dit:
+  hidden: 384
+  depth: 12
+  heads: 6
+  patch: 8
+  use_sparse: false
+  use_cameras: true
+  epochs: 60
+  batch_size: 16
+  grad_accum: 1
+  lr: 0.0001
+  weight_decay: 0.0
+  warmup_steps: 1000
+  ema_decay: 0.999
+  val_every: 5
+  num_workers: 2
+  seed: 0
+  ckpt_dir: checkpoints/dit_no_sparse
+  log_dir: runs/dit_no_sparse

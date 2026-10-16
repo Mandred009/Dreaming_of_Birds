@@ -1,4 +1,4 @@
-"""Evaluate on the test split (v2: 6 BEV layers).  Usage: python evaluate.py --config config.yaml
+"""Evaluate on the test split (v2: 6 BEV layers).  Usage: python evaluate.py --config config.yaml [--dit_only]
 
 Rows: A projection, B U-Net, D pixel diffusion (1 and 4 samples), F hybrid DiT (1 and 4 samples).
 Every method is a function  (sparse [B,6,H,W] float cuda, cams or None) -> probabilities [B,6,H,W];
@@ -65,7 +65,9 @@ def load_diffusion(cfg, kind, device, num_samples):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    cfg = yaml.safe_load(open(ap.parse_args().config))
+    ap.add_argument("--dit_only", action="store_true", help="only the DiT rows (for ablation configs)")
+    args = ap.parse_args()
+    cfg = yaml.safe_load(open(args.config))
     device = "cuda"
     k_mean = cfg["pixel_diffusion"]["num_samples"]
     use_cams = cfg["dit"]["use_cameras"] and os.path.exists(os.path.join(cfg["dit"]["ckpt_dir"], "best.pt"))
@@ -78,6 +80,8 @@ def main():
                   (f"D: pixel diffusion ({k_mean}-sample mean)", load_diffusion(cfg, "D", device, k_mean)),
                   ("F: hybrid DiT (1 sample)", load_diffusion(cfg, "F", device, 1)),
                   (f"F: hybrid DiT ({k_mean}-sample mean)", load_diffusion(cfg, "F", device, k_mean))]
+    if args.dit_only:
+        candidates = candidates[-2:]
     k = cfg["eval"]["num_qualitative"]
     ids = set(np.linspace(0, len(test) - 1, k).astype(int).tolist())
     results, preds = {}, {}

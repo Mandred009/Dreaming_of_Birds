@@ -76,3 +76,16 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 - vs B: map +0.106 (ped_crossing 0.155 -> 0.341), objects -0.034. Val mIoU still rising slowly at epoch 60 (0.284 -> 0.285).
 - **Qualitative:** DiT draws coherent intersections, crossings and lane dividers that the sparse input barely shows (it attends to the images and has a layout prior); cars are crisp rectangles, but some are misplaced, so per-cell IoU punishes them (same effect as E4).
 - **Takeaway:** first diffusion model to beat the U-Net overall. The gain is in map layout, which needs image context + global attention; objects still favour B. Open question: how much comes from the cameras vs the transformer -> ablations use_cameras=False / use_sparse=False.
+
+## E10 — DiT ablations: what does the gain come from? (2026-10-16)
+- Same DiT, seed, 60 epochs; one input removed. Configs `configs/dit_no_cams.yaml` (no cross-attention, 77 min) and `configs/dit_no_sparse.yaml` (patch embedding sees only x_t, 92 min); `run_dit_ablations.sh`; `evaluate.py --dit_only`.
+- **Result (test, 4-sample mean):**
+
+| Variant | map mIoU | obj mIoU | mIoU |
+|---|---|---|---|
+| B: U-Net (sparse only) | 0.316 | 0.148 | 0.260 |
+| F full (sparse + cameras) | **0.422** | 0.114 | **0.319** |
+| F without cameras (sparse only) | 0.331 | 0.113 | 0.258 |
+| F without sparse (cameras only) | 0.409 | 0.089 | 0.302 |
+
+- **Takeaway:** the map gain comes from the cameras, not the transformer: without them the DiT is no better than the U-Net (0.258 vs 0.260; ped_crossing 0.169 vs 0.341 with cameras). Cameras alone, without any depth/seg projection, already reach 0.302, so the frozen DINOv2 + ray encoding learns most of the image-to-BEV lifting itself. The sparse projection still adds geometry for objects (obj 0.089 -> 0.114) and a little for the map. Objects remain best with the plain U-Net (0.148): per-cell IoU still favours its blobs over the DiT's sharper but sometimes misplaced boxes.

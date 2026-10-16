@@ -22,6 +22,8 @@ Colours: dark grey = drivable, white = crossing, green = walkway, yellow = divid
 
 **F: hybrid DiT** (`models/dit.py`, 45.6M params): BEV tokens = 8x8 patches of [noisy map, sparse BEV] (625 tokens). Each of 12 blocks does self-attention over BEV tokens, then cross-attention to 672 camera tokens (frozen DINOv2-small patch features + an MLP of each patch's ray in the ego frame (PETR-style) + a camera-id embedding), then an MLP, all modulated by the timestep (adaLN-Zero). Predicts the clean map's logits; sampled with 20-step DDIM.
 
+**Ablations** (E10, 4-sample mean, test): removing the cameras drops the DiT to mIoU 0.258 (map 0.331), the same as the U-Net, so the map gain comes from the images, not the transformer. Removing the sparse projection instead gives 0.302 (map 0.409, obj 0.089): cameras alone carry most of the layout, while the projected depth/seg mainly helps place objects.
+
 The v1 sections below (objects only, nuScenes-mini) are kept as the history of how I got here.
 
 ## Pipeline
