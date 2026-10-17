@@ -1,4 +1,4 @@
-"""Multi-label segmentation metrics for the 6 BEV layers (v2).
+"""Multi-label segmentation metrics for the 6 BEV layers.
 
 Layers are independent binary masks (a cell can be drivable AND a ped crossing), so there is no
 confusion matrix: we accumulate TP / FP / FN per layer over the whole split and take

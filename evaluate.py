@@ -1,12 +1,9 @@
-"""Evaluate on the test split (v2: 6 BEV layers).  Usage: python evaluate.py --config config.yaml [--dit_only]
+"""Evaluate on the test split.  Usage: python evaluate.py --config config.yaml [--ablation {no_cams,no_sparse}]
 
 Rows: A projection, B U-Net, D pixel diffusion (1 and 4 samples), F hybrid DiT (1 and 4 samples).
+With --ablation only the two DiT rows are evaluated, for that ablated checkpoint.
 Every method is a function  (sparse [B,6,H,W] float cuda, cams or None) -> probabilities [B,6,H,W];
 metrics.evaluate_model thresholds at 0.5 and accumulates per-layer TP/FP/FN.
-
-Model C (SD1.5 + ControlNet) and E (diffusion refiner on B) were 3-class v1 experiments. They are not
-ported to the 6-layer data and are not evaluated here; their code stays in git history and their
-results in EXPERIMENTS.md and results/*.md (v1).
 """
 import argparse
 import os
@@ -20,7 +17,7 @@ from torch.utils.data import DataLoader
 
 from dataset import BEVDataset
 from metrics import LAYER_NAMES, evaluate_model
-from models.dit import build_dit
+from models.dit import ABLATIONS, apply_ablation, build_dit
 from models.pixel_diffusion import cosine_alpha_bar, predict_probs
 from models.unet import build_denoiser, build_unet
 from viz import sparse_to_rgb, target_to_rgb
@@ -65,9 +62,11 @@ def load_diffusion(cfg, kind, device, num_samples):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--dit_only", action="store_true", help="only the DiT rows (for ablation configs)")
+    ap.add_argument("--ablation", choices=ABLATIONS, help="evaluate the DiT trained with this ablation (DiT rows only)")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
+    if args.ablation:
+        apply_ablation(cfg, args.ablation)
     device = "cuda"
     k_mean = cfg["pixel_diffusion"]["num_samples"]
     use_cams = cfg["dit"]["use_cameras"] and os.path.exists(os.path.join(cfg["dit"]["ckpt_dir"], "best.pt"))
@@ -80,7 +79,7 @@ def main():
                   (f"D: pixel diffusion ({k_mean}-sample mean)", load_diffusion(cfg, "D", device, k_mean)),
                   ("F: hybrid DiT (1 sample)", load_diffusion(cfg, "F", device, 1)),
                   (f"F: hybrid DiT ({k_mean}-sample mean)", load_diffusion(cfg, "F", device, k_mean))]
-    if args.dit_only:
+    if args.ablation:
         candidates = candidates[-2:]
     k = cfg["eval"]["num_qualitative"]
     ids = set(np.linspace(0, len(test) - 1, k).astype(int).tolist())

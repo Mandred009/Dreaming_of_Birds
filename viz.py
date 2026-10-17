@@ -1,9 +1,7 @@
 """Shared colour helpers so every script paints classes the same way."""
 import numpy as np
 
-# Target / prediction classes: background, vehicle, pedestrian.
-TARGET_COLORS = np.array([[0, 0, 0], [255, 60, 60], [60, 255, 60]], dtype=np.uint8)
-# Sparse channels (v2): road, sidewalk, terrain, vehicle, person, obstacle.
+# Sparse channels : road, sidewalk, terrain, vehicle, person, obstacle.
 SPARSE_COLORS = np.array([[120, 120, 120], [190, 190, 255], [150, 110, 60], [255, 60, 60],
                           [60, 255, 60], [80, 120, 255]], dtype=np.uint8)
 SPARSE_ORDER = [0, 1, 2, 5, 3, 4]   # paint order: small/important classes last, so they stay on top
@@ -28,7 +26,3 @@ def target_to_rgb(target):
         img[target[c] > 0] = LAYER_COLORS[c]
     return img
 
-
-def label_to_rgb(label):
-    """[H,W] int map of {0,1,2} -> RGB image."""
-    return TARGET_COLORS[label]

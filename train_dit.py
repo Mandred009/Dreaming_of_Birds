@@ -1,4 +1,4 @@
-"""Train the hybrid DiT (model F).  Usage: python train_dit.py --config config.yaml [--epochs N]
+"""Train the hybrid DiT (model F).  Usage: python train_dit.py --config config.yaml [--epochs N] [--ablation {no_cams,no_sparse}]
 
 Same diffusion recipe as model D (cosine schedule, x0-logit prediction, pos_weighted BCE + Dice, DDIM);
 only the denoiser differs, so the comparison D vs F isolates the network + camera tokens.
@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import BEVDataset
 from metrics import evaluate_model, format_metrics
-from models.dit import build_dit
+from models.dit import ABLATIONS, apply_ablation, build_dit
 from models.pixel_diffusion import cosine_alpha_bar, denoise_loss, predict_probs
 from train import layer_pos_weights, make_loss, seed_everything
 
@@ -45,9 +45,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--epochs", type=int, default=None, help="override config (smoke test)")
-    ap.add_argument("--max_steps", type=int, default=None, help="stop after this many optimizer steps (smoke test)")
+    ap.add_argument("--ablation", choices=ABLATIONS, help="train a DiT variant with one input removed")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config))
+    if args.ablation:
+        apply_ablation(cfg, args.ablation)
     d, t, p = cfg["dit"], cfg["train"], cfg["pixel_diffusion"]
     epochs = args.epochs or d["epochs"]
     seed_everything(d["seed"])
@@ -104,8 +106,7 @@ def main():
         print(f"ep {epoch:3d} | train loss {train_loss:.4f} | step {step} | {(time.time() - start) / 60:.1f} min", flush=True)
         torch.save(dict(model=model.state_dict(), ema=ema.state_dict()), os.path.join(d["ckpt_dir"], "last.pt"))
 
-        done = args.max_steps is not None and step >= args.max_steps
-        if epoch % d["val_every"] == 0 or epoch == epochs or done:
+        if epoch % d["val_every"] == 0 or epoch == epochs:
             m = sample_val(ema, val_ds, alpha_bar, cfg, device, p["ddim_steps"])   # EMA weights
             mem = torch.cuda.max_memory_allocated() / 2**20
             print(f"   val (EMA, DDIM {p['ddim_steps']}) {format_metrics(m)} | peak {mem:.0f} MiB", flush=True)
@@ -114,8 +115,6 @@ def main():
             if m["mIoU"] > best:
                 best = m["mIoU"]
                 torch.save(ema.state_dict(), os.path.join(d["ckpt_dir"], "best.pt"))   # EMA weights only
-        if done:
-            break
     print(f"best val mIoU {best:.4f}; total time {(time.time() - start) / 60:.1f} min")
 
 

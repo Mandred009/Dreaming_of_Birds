@@ -12,7 +12,6 @@ Block (adaLN-Zero): the timestep embedding gives shift/scale/gate for each of th
   self-attention (BEV<->BEV), cross-attention (BEV queries -> camera keys/values), MLP.
   The modulation Linear is zero-initialised so every block starts as the identity (stable training).
 """
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -140,3 +139,14 @@ def build_dit(cfg):
                 cfg["unet"]["in_channels"], d["use_sparse"], d["use_cameras"])
     print(f"DiT parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
     return model
+
+
+ABLATIONS = {"no_cams": "use_cameras", "no_sparse": "use_sparse"}   # name -> the dit flag it switches off
+
+
+def apply_ablation(cfg, name):
+    """Turn off one DiT input and move checkpoints/logs/results to *_<name> so the full model is untouched."""
+    cfg["dit"][ABLATIONS[name]] = False
+    cfg["dit"]["ckpt_dir"] += f"_{name}"
+    cfg["dit"]["log_dir"] += f"_{name}"
+    cfg["eval"]["results_dir"] = f"results/ablation_{name}"

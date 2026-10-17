@@ -1,6 +1,6 @@
-"""Train the pixel-space conditional diffusion model D on the 6-layer v2 data.
+"""Train the pixel-space conditional diffusion model D on the 6-layer BEV data.
 Usage: python train_pixel_diffusion.py --config config.yaml [--epochs N]
-(The v1 --refiner (E5) and --probe options were removed; see git history / EXPERIMENTS.md.)"""
+"""
 import argparse
 import os
 import time

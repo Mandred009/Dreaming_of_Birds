@@ -6,7 +6,6 @@ The denoiser predicts x0 (as per-layer logits, 6 independent binary layers), see
 """
 import math
 import torch
-import torch.nn.functional as F
 
 
 def cosine_alpha_bar(T, s=0.008):
@@ -14,7 +13,7 @@ def cosine_alpha_bar(T, s=0.008):
     divided by its value at t=0 so alpha_bar(0) = 1. alpha_bar_t is the fraction of signal
     variance left at step t: x_t = sqrt(ab) * x0 + sqrt(1 - ab) * noise.
     Returns a tensor [T]; index i is diffusion step i (0 = almost clean, T-1 = almost pure noise).
-    Unlike SD's linear schedule it reaches ~0 at the end, so x_{T-1} really is pure noise."""
+    Unlike a linear schedule it reaches ~0 at the end, so x_{T-1} really is pure noise."""
     steps = torch.arange(T + 1, dtype=torch.float64)
     f = torch.cos((steps / T + s) / (1 + s) * math.pi / 2) ** 2
     ab = (f / f[0])[1:]                      # drop t=0 -> index i means step i+1 of the formula
@@ -48,14 +47,6 @@ def denoise_loss(model, sparse, target, alpha_bar, loss_fn, cams=None):
     t = torch.randint(0, len(alpha_bar), (B,), device=target.device)
     x_t = q_sample(make_x0(target), t, torch.randn_like(target), alpha_bar)
     return loss_fn(model(x_t, sparse, t, cams).float(), target)
-
-
-@torch.no_grad()
-def predict_x0_once(model, sparse, target, t_value, alpha_bar, cams=None):
-    """Probe: noise the true layers to level t_value, return the one-step x0 prediction (bool)."""
-    t = torch.full((len(target),), t_value, device=target.device)
-    x_t = q_sample(make_x0(target), t, torch.randn_like(target), alpha_bar)
-    return model(x_t, sparse, t, cams) > 0
 
 
 @torch.no_grad()

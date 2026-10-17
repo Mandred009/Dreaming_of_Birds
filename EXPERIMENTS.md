@@ -1,16 +1,15 @@
 # Experiment log
 
 One entry per experiment: what changed, why, result, takeaway. Newest last.
-Metrics are IoU on the **test** split (nuScenes `mini_val`: scene-0103, scene-0916, 81 frames) unless stated.
-mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **val** scene (scene-0655).
+E0-E5 (v1) = objects only (vehicle / pedestrian), nuScenes-mini, test = `mini_val` (81 frames), mIoU = mean of vehicle and pedestrian IoU, model selection on scene-0655. Their code (SD1.5 ControlNet "C", diffusion refiner "E") lives in git history at commit b5afca6.
+E6-E10 (v2) = full 6-layer BEV on nuScenes trainval, metrics are per-layer IoU on the official val scenes (see E6).
 
-## Setup (shared by all experiments)
+## Setup (v1)
 - Data: nuScenes v1.0-mini, 6 cameras, keyframes only.
-- Target: 200×200 BEV, 0.5 m/cell, ±50 m, ego-centred. Classes: background / vehicle / pedestrian, rasterised from 3D boxes (boxes with 0 lidar+radar points skipped).
-- Input ("sparse BEV"): per camera, Depth-Anything-V2 metric depth + SegFormer-B2 (Cityscapes) → unproject → ego frame → 4-channel occupancy (flat, vehicle, person, obstacle), height filter z ∈ [-1, 3] m.
+- Target: 200x200 BEV, 0.5 m/cell, +-50 m, ego-centred; background / vehicle / pedestrian rasterised from 3D boxes (boxes with 0 lidar+radar points skipped).
+- Input: per camera, Depth-Anything-V2 metric depth + SegFormer-B2 (Cityscapes) -> unproject -> ego frame -> 4-channel occupancy (flat, vehicle, person, obstacle), height filter z in [-1, 3] m.
 
 ---
-
 ## E0 — Projection-only baselines (2026-10-15, commit 76662e3)
 - **A:** label a cell vehicle/pedestrian if any projected point of that class lands in it.
 - **A+:** same, 3×3 dilation.
@@ -40,11 +39,11 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 - Setup: Palette/SR3 style, trained from scratch. x0 = one-hot target in {-1,+1}; denoiser input = concat(noisy map 3ch, sparse 4ch) = 7 ch; output 3 channels = x0 class logits. Backbone = B's U-Net (widths 32-64-128-256) + sinusoidal timestep embedding → MLP → per-channel bias in every conv block (2.05M params; B's code path/checkpoint unchanged). Hand-written cosine schedule (T=1000), q_sample, DDIM (20 steps, eta=0, from pure noise). Loss = B's weighted CE + Dice on the x0 logits. AdamW lr 1e-3 cosine, batch 16, flip, 300 epochs; validation (full 20-step DDIM) every 10 epochs on scene-0655, best by val mIoU.
 - Cost: 6.7 min training, 2.0 GB VRAM (peak allocated).
 - **Result (test):** 1 sample veh **0.117** / ped 0.007 / mIoU **0.062**; 4-sample mean-of-softmax veh 0.129 / ped 0.002 / mIoU 0.066. (B: 0.151 / 0.041 / 0.096; E3: 0.019.) Best val mIoU 0.067 (epoch 230); val curve is noisy (0.01-0.07), ped val IoU 0 throughout.
-- **Probe (one-step x0 IoU, mIoU):** t=50: train/val/test all 1.000 (the noisy map almost contains the answer, so this is trivial). t=999 (pure noise, i.e. sparse-only): train 0.116 (veh 0.161) / val 0.062 / test 0.051 (veh 0.102). E3 probe was train 0.49 vs test 0.002 at t=999: E4 does not show E3's memorise-vs-nothing split, and test is above zero, but the t=999 predictor (the part that decides *where* objects go) is weaker than B (veh 0.151).
+- **Probe (one-step x0 mIoU):** t=50 train/val/test all 1.000 (noisy map almost contains the answer). t=999 (sparse-only): train 0.116 / val 0.062 / test 0.051 (veh 0.102). Unlike E3 (0.49 vs 0.002) test is above zero, but the part deciding *where* objects go is weaker than B (veh 0.151).
 - **Takeaway:** the concatenated-condition path fixes E3's failure (objects are in roughly the right places, crisp rectangular boxes instead of B's blobs), but it does not beat the plain U-Net. Most training steps are at low/mid t where the noisy map leaks the answer, so the hard sparse→BEV mapping is learned from only a small fraction of the gradient; pedestrians are essentially lost. Under this metric (strict per-cell IoU) sharper-but-misplaced boxes score below blurry-but-centred blobs. Controlled B vs D comparison: diffusion objective alone gives no gain on 282 frames.
 
 ## E5 — Diffusion refiner conditioned on B's softmax (2026-10-15, commit 7148b56)
-- Setup = E4 + one change: denoiser input = concat(noisy map 3ch, sparse 4ch, **B's softmax probabilities 3ch**) = 10 ch (2.05M params, +~1k in the first conv). Everything else identical to E4 (cosine schedule, x0-logit loss with B's weighted CE+Dice, AdamW lr 1e-3, batch 16, flip, DDIM 20 steps, seed 0, same sampling generator seeds). B (`checkpoints/unet/best.pt`, frozen) is run once per frame and its softmax kept in memory; flip augmentation flips the probabilities together with sparse/target. Code: `--refiner` flag in `train_pixel_diffusion.py` (sets `condition_on_unet=True`, switches to `checkpoints/pixel_diffusion_refiner` / `runs/pixel_diffusion_refiner`); the condition is just a 7-channel "sparse" argument, so `models/pixel_diffusion.py` sampling/loss are unchanged. B, C, D rows reproduce exactly.
+- Setup = E4 + one change: denoiser input also gets B's frozen softmax probabilities (3 ch) -> 10 ch; flip augmentation flips them with sparse/target. Everything else identical (`--refiner` flag, removed after v1).
 - Cost: 3.2 min (early stop at epoch 140, best val mIoU 0.095 at epoch 60), 2.0 GB VRAM. Val curve noisy (0.079-0.095), ped val IoU ~0.
 - **Result (test):** 1 sample veh **0.136** / ped 0.015 / mIoU **0.076**; 4-sample mean veh 0.141 / ped 0.013 / mIoU 0.077. (B 0.151 / 0.041 / 0.096; D 0.117 / 0.007 / 0.062 and 0.129 / 0.002 / 0.066.)
 - **Probe (one-step x0 mIoU):** t=50 train/val/test ~1.0; t=999: train 0.244 (veh 0.452) / val 0.093 (veh 0.186) / test 0.070 (veh 0.137, ped 0.003). Versus E4 t=999 test veh 0.102.
@@ -56,7 +55,7 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 
 ## E6 — Data v2 (2026-10-15, commit e8c9c86)
 - Goal change: predict the *whole* BEV from 6 cameras, not just objects. Data: trainval camera blobs 01-04 (keyframes only), 340 scenes, 13,529 frames. Split by scene: test = official val scenes (1,982 frames), val = seeded 8% of train scenes (919), train 10,628.
-- Sparse input v2: 6 ch (road, sidewalk, terrain, vehicle, person, obstacle) from Depth-Anything-V2 metric depth + SegFormer-B2 Cityscapes, same unprojection as v1.
+- Sparse input: 6 ch (road, sidewalk, terrain, vehicle, person, obstacle) from Depth-Anything-V2 metric depth + SegFormer-B2 Cityscapes.
 - Target v2: multi-label 6 layers — drivable_area, ped_crossing, walkway, divider (road+lane dividers, dilated) from the nuScenes map expansion v1.3, plus vehicle / pedestrian boxes. Loss for all models: BCE with per-layer pos_weight (sqrt neg/pos) + soft Dice. Metric: per-layer IoU at 0.5; map_mIoU = layers 0-3, obj_mIoU = 4-5.
 - Cost: preprocessing several hours (GPU, finished 00:55 on 2026-10-16), map targets 39 min (CPU). Cache 162M, DINOv2 features 6.8G.
 
@@ -78,7 +77,7 @@ mIoU = mean of vehicle and pedestrian IoU. Model selection uses the held-out **v
 - **Takeaway:** first diffusion model to beat the U-Net overall. The gain is in map layout, which needs image context + global attention; objects still favour B. Open question: how much comes from the cameras vs the transformer -> ablations use_cameras=False / use_sparse=False.
 
 ## E10 — DiT ablations: what does the gain come from? (2026-10-16)
-- Same DiT, seed, 60 epochs; one input removed. Configs `configs/dit_no_cams.yaml` (no cross-attention, 77 min) and `configs/dit_no_sparse.yaml` (patch embedding sees only x_t, 92 min); `run_dit_ablations.sh`; `evaluate.py --dit_only`.
+- Same DiT, seed, 60 epochs; one input removed. `train_dit.py --ablation no_cams` (no cross-attention, 77 min) and `--ablation no_sparse` (patch embedding sees only x_t, 92 min); evaluated with `evaluate.py --ablation <name>` into `results/ablation_<name>/`; run by `run_pipeline.sh`.
 - **Result (test, 4-sample mean):**
 
 | Variant | map mIoU | obj mIoU | mIoU |

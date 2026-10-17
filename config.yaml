@@ -1,11 +1,11 @@
-# Dataset switch: 'mini' uses the top-level dataroot/version/out_dir/data below (original behaviour);
+# Dataset switch: 'mini' uses the top-level dataroot/version/out_dir/data below;
 # 'trainval' uses the `trainval` block (dataset.dataset_cfg picks the right one).
 dataset: trainval
 
 # Paths (mini)
 dataroot: ~/datasets/nuscenes
 version: v1.0-mini
-out_dir: ~/datasets/bev_cache_v2   # v2 = 6-ch sparse + boxes + ego pose; outside the repo: cache is ~hundreds of MB
+out_dir: ~/datasets/bev_cache_v2   # BEV cache (6-ch sparse + targets + ego pose), kept outside the repo
 img_feat_dir: ~/datasets/bev_feat_v2   # frozen DINOv2 camera tokens (extract_image_features.py), one <token>_img.npz per frame
 
 # BEV grid, ego frame (x forward, y left). Row 0 = far forward, col 0 = far left.
@@ -51,7 +51,7 @@ img_features:
   image_hw: [224, 392]   # multiples of the ViT patch size 14 -> 16 x 28 patch tokens
   pool: 2                # 2x2 average pool -> 8 x 14 = 112 tokens per camera, 672 per frame
 
-# U-Net baseline (v2: 6 sparse channels in, 6 independent (multi-label) map/object layers out)
+# U-Net baseline (6 sparse channels in, 6 independent (multi-label) map/object layers out)
 unet:
   in_channels: 6
   num_classes: 6
@@ -69,31 +69,13 @@ train:
   num_workers: 2
   augment_flip: true     # left-right mirror of sparse + target (B and D only)
   dice_weight: 1.0       # loss = pos_weighted BCE + dice_weight * soft Dice (per layer)
-  ckpt_dir: checkpoints/v2/unet     # v2 outputs live under v2/ so the v1 checkpoints stay untouched
-  log_dir: runs/v2/unet
+  ckpt_dir: checkpoints/unet  
+  log_dir: runs/unet
 
 # Evaluation
 eval:
-  results_dir: results/v2   # v1 results (results/*.md, *.png) are history, untouched
+  results_dir: results
   num_qualitative: 4
-
-# Diffusion (model C, v1 only: not ported to the 6-layer v2 data): Stable Diffusion 1.5 + ControlNet. Only the ControlNet is trained.
-diffusion:
-  base_model: runwayml/stable-diffusion-v1-5
-  prompt: "a bird's-eye-view semantic map"   # fixed, so no classifier-free guidance
-  image_size: 256          # class map is resized 200 -> 256 so the VAE latent is 32x32
-  seed: 0
-  lr: 0.0001               # 1e-5 (usual ControlNet value) had not started using the control input after 2000 steps
-  batch_size: 8
-  grad_accum: 1
-  shift_prob: 0.5          # augmentation: chance of shifting a frame by a multiple of 25 BEV cells
-  point_keep_min: 0.5      # augmentation: each frame keeps a random 50-100% of its sparse points
-  max_steps: 14000         # optimizer steps of the final run 
-  eval_every: 1000
-  ddim_steps: 25           # sampling steps used for validation and inference
-  vote_samples: 4          # samples per frame for the majority-vote row
-  ckpt_dir: checkpoints/diffusion
-  log_dir: runs/diffusion
 
 # Pixel-space conditional diffusion (model D): same U-Net backbone as B, trained from scratch.
 # Input = concat(noisy layers [6ch], sparse BEV [6ch]); backbone widths come from `unet.channels`.
@@ -111,8 +93,8 @@ pixel_diffusion:
   val_every: 5             # epochs between validation runs (each is a full 20-step DDIM sampling)
   patience: 4              # early stop after this many validations without val mIoU improvement
   num_workers: 2
-  ckpt_dir: checkpoints/v2/pixel_diffusion
-  log_dir: runs/v2/pixel_diffusion
+  ckpt_dir: checkpoints/pixel_diffusion
+  log_dir: runs/pixel_diffusion
 
 # Hybrid DiT (model F): diffusion transformer over 8x8 BEV patches, cross-attending to frozen DINOv2 camera tokens.
 # Uses the same T / cosine schedule / DDIM / loss as `pixel_diffusion` (read from there), only the network differs.

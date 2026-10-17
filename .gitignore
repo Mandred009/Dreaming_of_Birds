@@ -2,7 +2,6 @@ Depth-Anything-3
 checkpoints
 bev_outputs
 .vscode
-runs
 __pycache__
 data.zip
 
@@ -12,3 +11,5 @@ data.zip
 *.log
 checkpoints/
 logs/
+runs/
+*.pt

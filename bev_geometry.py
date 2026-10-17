@@ -10,9 +10,8 @@ CONVENTION (used everywhere in this project)
 import numpy as np
 import cv2
 
-# Cityscapes train id (0..18) -> coarse class (sparse input v2, 6 channels), -1 = ignore (sky).
+# Cityscapes train id (0..18) -> coarse class (6 sparse channels), -1 = ignore (sky).
 # 0 road  1 sidewalk  2 terrain  3 vehicle  4 person  5 obstacle (building, wall, fence, pole, light, sign, vegetation)
-# (v1 had 4 channels with road/sidewalk/terrain merged into one "flat"; see git history.)
 CITYSCAPES_TO_COARSE = np.array([
     0,   # 0 road
     1,   # 1 sidewalk

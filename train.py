@@ -24,7 +24,7 @@ def seed_everything(seed):
 
 def layer_pos_weights(freq):
     """BCE pos_weight per layer = sqrt(neg / pos). Full neg/pos would give pedestrians (~0.1% of cells)
-    a ~1000x weight and make training unstable; the sqrt softens it (same idea as the v1 class weights)."""
+    a ~1000x weight and make training unstable; the sqrt softens it."""
     freq = np.clip(freq, 1e-6, 1 - 1e-6)
     return torch.tensor(np.sqrt((1 - freq) / freq), dtype=torch.float32)
 
@@ -40,9 +40,8 @@ def soft_dice_loss(logits, target, eps=1.0):
 
 def make_loss(pos_weight, dice_weight):
     """Loss = pos_weighted BCE-with-logits + dice_weight * soft Dice.
-    The 6 layers are independent binary problems (a cell can be in several), so sigmoid/BCE per layer
-    replaces the softmax/CE of v1. BCE gives dense gradients on every cell; Dice optimises overlap
-    (what IoU measures) and ignores the huge background count."""
+    The 6 layers are independent binary problems (a cell can be in several), so sigmoid/BCE per layer.
+    BCE gives dense gradients on every cell; Dice optimises overlap (what IoU measures) and ignores the huge background count."""
     def loss_fn(logits, target):
         bce = F.binary_cross_entropy_with_logits(logits, target, pos_weight=pos_weight[None, :, None, None])
         return bce + dice_weight * soft_dice_loss(logits, target)
